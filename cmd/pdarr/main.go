@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/danrichardson/pdarr/internal/api"
 	"github.com/danrichardson/pdarr/internal/config"
 	"github.com/danrichardson/pdarr/internal/db"
 	"github.com/danrichardson/pdarr/internal/logger"
@@ -93,6 +94,7 @@ func runServe(cfgPath string) {
 
 	t := transcoder.New(enc, cfg.Transcoder.TempDir, log)
 	worker := queue.New(database, cfg, t, log)
+	scan := scanner.New(database, log)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -105,7 +107,14 @@ func runServe(cfgPath string) {
 		go gc.Run(ctx)
 	}
 
-	// TODO Phase 3: start HTTP server here.
+	// Start HTTP server in background.
+	httpServer := api.New(cfg, database, worker, scan, enc, log)
+	go func() {
+		if err := httpServer.Start(ctx); err != nil {
+			log.Error("HTTP server error", "error", err)
+		}
+	}()
+
 	worker.Run(ctx)
 }
 
