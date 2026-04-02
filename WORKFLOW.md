@@ -563,4 +563,8 @@ Questions to ask before starting a new phase:
 | 9 | ffprobe duration match ±1s for verification | Cheap, reliable check; full frame decode would be too slow for large files | Flag: should tolerance be configurable? |
 | 10 | `gorilla/mux` for routing (assumption) | Clean route pattern matching, well-maintained; alternatively stdlib 1.22 pattern routing could work | Flag: stdlib routing in Go 1.22 is now capable enough; may switch to avoid the dependency |
 | 11 | No real-time file watching (inotify) | Owner confirmed weekly-old files are fine; polling is simpler and more portable (works on NFS mounts) | No |
+| 13 | Container ID 260, not 240 | CT 240 is Home Assistant on pve3; 260 is next available pve2 2xx slot | No |
+| 14 | `intel-media-va-driver-non-free` required for HEVC encode | Free driver only provides HEVC decode; non-free adds `VAEntrypointEncSlice`. Added `non-free` to apt sources in CT 260. | No |
+| 15 | CT 260 uses DHCP | Owner preference; simpler, matches other containers | No |
+| 16 | HTTP router: Go 1.22 stdlib ServeMux | Owner chose stdlib over gorilla/mux; sufficient for ~15 endpoints, zero deps | No |
 | 12 | Plex rescan on failure: log and continue, don't fail the job | Plex notification is strictly optional; job success/failure should not depend on it | No |
