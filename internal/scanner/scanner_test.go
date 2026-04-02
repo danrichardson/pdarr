@@ -33,7 +33,7 @@ func TestScanFindsH264File(t *testing.T) {
 		Path:       dir,
 		Enabled:    true,
 		MinAgeDays: 7,
-		MaxBitrate: 4_000_000,
+		MaxBitrate: 0, // disabled — test clip bitrate is not deterministic
 		MinSizeMB:  0,
 	})
 	if err != nil {
@@ -112,7 +112,7 @@ func TestScanSkipsNewFile(t *testing.T) {
 		Path:       dir,
 		Enabled:    true,
 		MinAgeDays: 7,
-		MaxBitrate: 4_000_000,
+		MaxBitrate: 0, // disabled — we're testing age, not bitrate
 	})
 	dbDir, _ := database.GetDirectory(dirID)
 
@@ -136,7 +136,7 @@ func TestScanDeduplicates(t *testing.T) {
 		Path:       dir,
 		Enabled:    true,
 		MinAgeDays: 7,
-		MaxBitrate: 4_000_000,
+		MaxBitrate: 0, // disabled
 	})
 	dbDir, _ := database.GetDirectory(dirID)
 	s := scanner.New(database, testLog(t))
