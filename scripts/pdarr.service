@@ -1,0 +1,22 @@
+[Unit]
+Description=PDARR Media Transcoder
+After=network.target
+
+[Service]
+Type=simple
+User=pdarr
+Group=pdarr
+ExecStart=/usr/local/bin/pdarr serve -config /etc/pdarr/pdarr.toml
+Restart=on-failure
+RestartSec=10
+Environment=LIBVA_DRIVER_NAME=iHD
+
+# Allow access to /dev/dri for VAAPI
+SupplementaryGroups=video render
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pdarr
+
+[Install]
+WantedBy=multi-user.target
