@@ -1,6 +1,7 @@
 package transcoder
 
 import (
+	"bytes"
 	"fmt"
 	"os/exec"
 )
@@ -175,17 +176,5 @@ func (e *Encoder) String() string {
 }
 
 func containsBytes(haystack, needle []byte) bool {
-	for i := 0; i <= len(haystack)-len(needle); i++ {
-		match := true
-		for j := range needle {
-			if haystack[i+j] != needle[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
+	return bytes.Contains(haystack, needle)
 }
