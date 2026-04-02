@@ -1,0 +1,224 @@
+package scanner
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/danrichardson/pdarr/internal/db"
+)
+
+// VideoExtensions is the set of file extensions treated as video files.
+var VideoExtensions = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
+	".m4v": true, ".ts": true, ".m2ts": true, ".wmv": true,
+}
+
+// Result summarises a completed scan.
+type Result struct {
+	FilesScanned int
+	FilesQueued  int
+	FilesSkipped int
+}
+
+// Scanner walks directories and enqueues qualifying files.
+type Scanner struct {
+	db  *db.DB
+	log *slog.Logger
+}
+
+// New creates a Scanner.
+func New(database *db.DB, log *slog.Logger) *Scanner {
+	return &Scanner{db: database, log: log}
+}
+
+// ScanDirectory walks dir and enqueues qualifying files according to the
+// directory's configured rules.
+func (s *Scanner) ScanDirectory(ctx context.Context, dir *db.Directory) (*Result, error) {
+	if !dir.Enabled {
+		return &Result{}, nil
+	}
+
+	runID, err := s.db.InsertScanRun(sql.NullInt64{Int64: dir.ID, Valid: true})
+	if err != nil {
+		return nil, fmt.Errorf("start scan run: %w", err)
+	}
+
+	start := time.Now()
+	res := &Result{}
+
+	walkErr := filepath.WalkDir(dir.Path, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			s.log.Warn("walk error", "path", path, "error", err)
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !VideoExtensions[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+
+		res.FilesScanned++
+
+		queued, skip, err := s.maybeEnqueue(ctx, path, dir)
+		if err != nil {
+			s.log.Warn("enqueue error", "path", path, "error", err)
+			return nil
+		}
+		if queued {
+			res.FilesQueued++
+		}
+		if skip != "" {
+			res.FilesSkipped++
+			s.log.Debug("skip", "path", path, "reason", skip)
+		}
+		return nil
+	})
+
+	durationMS := time.Since(start).Milliseconds()
+	errMsg := ""
+	if walkErr != nil {
+		errMsg = walkErr.Error()
+	}
+	s.db.FinishScanRun(runID, res.FilesScanned, res.FilesQueued, res.FilesSkipped, durationMS, errMsg)
+
+	if walkErr != nil {
+		return res, fmt.Errorf("walk: %w", walkErr)
+	}
+
+	s.log.Info("scan complete",
+		"directory", dir.Path,
+		"scanned", res.FilesScanned,
+		"queued", res.FilesQueued,
+		"skipped", res.FilesSkipped,
+		"duration_ms", durationMS,
+	)
+	return res, nil
+}
+
+// maybeEnqueue evaluates a file against directory rules and inserts a pending
+// job if it qualifies. Returns (queued, skipReason, error).
+func (s *Scanner) maybeEnqueue(ctx context.Context, path string, dir *db.Directory) (bool, string, error) {
+	// Skip if already in jobs table with a non-failed status.
+	exists, err := s.db.SourcePathExists(path)
+	if err != nil {
+		return false, "", err
+	}
+	if exists {
+		return false, "already queued", nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, "", fmt.Errorf("stat: %w", err)
+	}
+
+	// Age check.
+	age := time.Since(info.ModTime())
+	minAge := time.Duration(dir.MinAgeDays) * 24 * time.Hour
+	if age < minAge {
+		return false, fmt.Sprintf("too new (%.0f days)", age.Hours()/24), nil
+	}
+
+	// Size check.
+	sizeMB := info.Size() / (1024 * 1024)
+	if dir.MinSizeMB > 0 && sizeMB < dir.MinSizeMB {
+		return false, fmt.Sprintf("too small (%d MB)", sizeMB), nil
+	}
+
+	// ffprobe for codec and bitrate.
+	probe, err := probeFile(path)
+	if err != nil {
+		return false, "", fmt.Errorf("probe: %w", err)
+	}
+
+	// Skip already-HEVC files.
+	if strings.EqualFold(probe.codec, "hevc") {
+		return false, "already HEVC", nil
+	}
+
+	// Bitrate check.
+	if dir.MaxBitrate > 0 && probe.bitrate <= dir.MaxBitrate {
+		return false, fmt.Sprintf("bitrate %d within limit", probe.bitrate), nil
+	}
+
+	job := &db.Job{
+		DirectoryID:    sql.NullInt64{Int64: dir.ID, Valid: true},
+		SourcePath:     path,
+		SourceSize:     info.Size(),
+		SourceCodec:    probe.codec,
+		SourceDuration: probe.duration,
+		SourceBitrate:  probe.bitrate,
+		Status:         db.JobPending,
+	}
+	_, err = s.db.InsertJob(job)
+	if err != nil {
+		return false, "", fmt.Errorf("insert job: %w", err)
+	}
+
+	s.log.Info("queued",
+		"path", path,
+		"codec", probe.codec,
+		"bitrate", probe.bitrate,
+		"size_mb", sizeMB,
+	)
+	return true, "", nil
+}
+
+type probeResult struct {
+	codec    string
+	bitrate  int64
+	duration float64
+}
+
+type ffprobeOutput struct {
+	Streams []struct {
+		CodecName string `json:"codec_name"`
+		CodecType string `json:"codec_type"`
+	} `json:"streams"`
+	Format struct {
+		Duration string `json:"duration"`
+		BitRate  string `json:"bit_rate"`
+	} `json:"format"`
+}
+
+func probeFile(path string) (*probeResult, error) {
+	out, err := exec.Command("ffprobe",
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_streams",
+		"-show_format",
+		path,
+	).Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe: %w", err)
+	}
+
+	var p ffprobeOutput
+	if err := json.Unmarshal(out, &p); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+
+	r := &probeResult{}
+	for _, s := range p.Streams {
+		if s.CodecType == "video" {
+			r.codec = s.CodecName
+			break
+		}
+	}
+
+	fmt.Sscanf(p.Format.Duration, "%f", &r.duration)
+	fmt.Sscanf(p.Format.BitRate, "%d", &r.bitrate)
+	return r, nil
+}
