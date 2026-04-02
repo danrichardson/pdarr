@@ -567,4 +567,5 @@ Questions to ask before starting a new phase:
 | 14 | `intel-media-va-driver-non-free` required for HEVC encode | Free driver only provides HEVC decode; non-free adds `VAEntrypointEncSlice`. Added `non-free` to apt sources in CT 260. | No |
 | 15 | CT 260 uses DHCP | Owner preference; simpler, matches other containers | No |
 | 16 | HTTP router: Go 1.22 stdlib ServeMux | Owner chose stdlib over gorilla/mux; sufficient for ~15 endpoints, zero deps | No |
+| 17 | SSE (Server-Sent Events) instead of WebSocket for live updates | All live events are server→client only (progress, scan, disk warnings); SSE is sufficient, needs no external dependency, and is simpler to implement and debug | No |
 | 12 | Plex rescan on failure: log and continue, don't fail the job | Plex notification is strictly optional; job success/failure should not depend on it | No |
