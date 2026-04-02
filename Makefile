@@ -18,13 +18,15 @@ build-linux:
 build-darwin:
 	GOOS=darwin GOARCH=arm64 go build $(GOFLAGS) -o $(DIST)/$(BINARY)-darwin-arm64 $(CMD)
 
+GO_PKGS := $(shell go list ./... | grep -v /frontend/)
+
 # Unit tests only (no ffmpeg required)
 test:
-	go test ./...
+	go test $(GO_PKGS)
 
 # Integration tests (requires ffmpeg on PATH)
 test-integration:
-	go test -tags integration -v ./...
+	go test -tags integration -v $(GO_PKGS)
 
 lint:
 	golangci-lint run ./...
