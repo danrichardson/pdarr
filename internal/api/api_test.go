@@ -33,8 +33,8 @@ func newTestServer(t *testing.T) (*api.Server, *db.DB) {
 	}
 	log := slog.Default()
 	worker := queue.New(database, cfg, transcoder.New(enc, "", log), nil, log)
-	scan := scanner.New(database, log)
-	return api.New(cfg, database, worker, scan, enc, log), database
+	scan := scanner.New(database, cfg.Safety.ProcessedDirName, log)
+	return api.New(cfg, "", database, worker, scan, nil, enc, log), database
 }
 
 func TestGetStatus(t *testing.T) {
@@ -135,8 +135,8 @@ func TestAuthRequired(t *testing.T) {
 	enc := &transcoder.Encoder{Type: transcoder.EncoderSoftware, DisplayName: "test",
 		BuildArgs: func(in, out string) []string { return nil }}
 	worker := queue.New(database, cfg, transcoder.New(enc, "", log), nil, log)
-	scan := scanner.New(database, log)
-	srv := api.New(cfg, database, worker, scan, enc, log)
+	scan := scanner.New(database, cfg.Safety.ProcessedDirName, log)
+	srv := api.New(cfg, "", database, worker, scan, nil, enc, log)
 
 	req := httptest.NewRequest("GET", "/api/v1/status", nil)
 	w := httptest.NewRecorder()
@@ -159,8 +159,8 @@ func TestAuthLogin(t *testing.T) {
 	enc := &transcoder.Encoder{Type: transcoder.EncoderSoftware, DisplayName: "test",
 		BuildArgs: func(in, out string) []string { return nil }}
 	worker := queue.New(database, cfg, transcoder.New(enc, "", log), nil, log)
-	scan := scanner.New(database, log)
-	srv := api.New(cfg, database, worker, scan, enc, log)
+	scan := scanner.New(database, cfg.Safety.ProcessedDirName, log)
+	srv := api.New(cfg, "", database, worker, scan, nil, enc, log)
 
 	// Wrong password — should get 401.
 	body := strings.NewReader(`{"password":"wrongpassword"}`)

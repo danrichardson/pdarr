@@ -3,6 +3,7 @@
 package verifier_test
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -11,20 +12,16 @@ import (
 )
 
 func TestVerifyPassesValidOutput(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not on PATH")
-	}
+	requireFFmpeg(t)
 
 	dir := t.TempDir()
 	input := filepath.Join(dir, "input.mkv")
 	output := filepath.Join(dir, "output.mkv")
 
-	// Large-ish H.264 input.
 	run(t, "ffmpeg", "-y", "-f", "lavfi",
 		"-i", "testsrc=duration=30:size=1280x720:rate=25",
 		"-c:v", "libx264", "-b:v", "8000k", input)
 
-	// Smaller output (lower bitrate).
 	run(t, "ffmpeg", "-y", "-i", input,
 		"-c:v", "libx264", "-b:v", "1000k", output)
 
@@ -35,12 +32,13 @@ func TestVerifyPassesValidOutput(t *testing.T) {
 	if !result.OK {
 		t.Errorf("expected OK, got: %s", result.Reason)
 	}
+	if result.Uncompressible {
+		t.Error("should not be marked uncompressible")
+	}
 }
 
 func TestVerifyFailsWhenOutputLarger(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not on PATH")
-	}
+	requireFFmpeg(t)
 
 	dir := t.TempDir()
 	input := filepath.Join(dir, "input.mkv")
@@ -51,7 +49,7 @@ func TestVerifyFailsWhenOutputLarger(t *testing.T) {
 		"-i", "testsrc=duration=10:size=320x240:rate=25",
 		"-c:v", "libx264", "-b:v", "100k", input)
 
-	// Higher-bitrate output — should fail verification.
+	// Higher-bitrate output — should be flagged as uncompressible.
 	run(t, "ffmpeg", "-y", "-i", input,
 		"-c:v", "libx264", "-b:v", "5000k", output)
 
@@ -61,6 +59,44 @@ func TestVerifyFailsWhenOutputLarger(t *testing.T) {
 	}
 	if result.OK {
 		t.Error("expected verification to fail (output larger than input)")
+	}
+	if !result.Uncompressible {
+		t.Error("expected Uncompressible=true when output >= input size")
+	}
+}
+
+func TestVerifyFailsSuspiciouslySmallOutput(t *testing.T) {
+	requireFFmpeg(t)
+
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input.mkv")
+
+	run(t, "ffmpeg", "-y", "-f", "lavfi",
+		"-i", "testsrc=duration=30:size=1280x720:rate=25",
+		"-c:v", "libx264", "-b:v", "8000k", input)
+
+	// Write a tiny fake output that is well below the size floor.
+	output := filepath.Join(dir, "output.mkv")
+	if err := os.WriteFile(output, []byte("not a real video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := verifier.Verify(input, output, 1.0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.OK {
+		t.Error("expected failure for suspiciously small output")
+	}
+	if result.Uncompressible {
+		t.Error("suspiciously small output should not be marked uncompressible")
+	}
+}
+
+func requireFFmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not on PATH, skipping integration test")
 	}
 }
 

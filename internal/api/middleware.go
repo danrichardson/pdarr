@@ -26,6 +26,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 		token := extractBearer(r)
 		if token == "" {
+			// SSE/WS clients pass token as query param since EventSource can't set headers.
+			token = r.URL.Query().Get("token")
+		}
+		if token == "" {
 			jsonError(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -89,4 +93,10 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(status int) {
 	rw.status = status
 	rw.ResponseWriter.WriteHeader(status)
+}
+
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

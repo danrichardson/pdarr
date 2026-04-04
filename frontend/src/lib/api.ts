@@ -41,7 +41,12 @@ export interface Status {
   jobs_done: number
   jobs_failed: number
   disk_free_gb: number
-  pause_threshold: number
+  disk_path: string
+  next_scan_at: string | null
+  last_scan_at: string | null
+  cpu_percent: number
+  gpu_mhz: number
+  gpu_percent: number  // -1 = unavailable; use gpu_mhz as proxy instead
 }
 
 export interface Job {
@@ -51,9 +56,10 @@ export interface Job {
   SourceCodec: string
   SourceDuration: number
   SourceBitrate: number
-  Status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'skipped'
+  Status: 'pending' | 'running' | 'done' | 'staged' | 'failed' | 'cancelled' | 'skipped' | 'excluded' | 'restored'
   Progress: number
   BytesSaved: { Int64: number; Valid: boolean } | null
+  OutputSize: { Int64: number; Valid: boolean } | null
   ErrorMessage: { String: string; Valid: boolean } | null
   EncoderUsed: { String: string; Valid: boolean } | null
   StartedAt: { Time: string; Valid: boolean } | null
@@ -88,6 +94,62 @@ export interface Stats {
   UpdatedAt: string
 }
 
+export interface OriginalRecord {
+  id: number
+  job_id: number
+  original_path: string
+  held_path: string
+  output_path: string
+  original_size: number
+  output_size: number
+  expires_at: string
+  created_at: string
+  days_remaining: number
+}
+
+export interface RuntimeConfig {
+  root_dirs: string[]
+  worker_concurrency: number
+  scan_interval_hours: number
+  processed_dir_name: string
+  originals_retention_days: number
+  fail_threshold: number
+  system_fail_threshold: number
+  delete_confirm_single: boolean
+  plex_enabled: boolean
+  plex_base_url: string
+  plex_token: string  // empty string = not set; "SET" = already configured
+}
+
+export interface LastScanRun {
+  ID: number
+  FilesScanned: number
+  FilesQueued: number
+  FilesSkipped: number
+  DurationMS: { Int64: number; Valid: boolean } | null
+  StartedAt: string
+  FinishedAt: { Time: string; Valid: boolean } | null
+}
+
+export interface FileEntry {
+  path: string
+  name: string
+  size: number       // bytes
+  modified: string   // ISO timestamp
+  codec?: string
+  bitrate?: number   // bps
+  duration?: number  // seconds
+  job_status?: string
+  bytes_saved?: number
+}
+
+export interface FSBrowseResult {
+  current: string
+  parent: string
+  dirs: string[]
+  files: FileEntry[]
+}
+
 // ---- API calls ----
 
 export const api = {
@@ -112,8 +174,30 @@ export const api = {
   deleteDirectory: (id: number) => request<void>('DELETE', `/directories/${id}`),
 
   triggerScan: () => request<{ status: string }>('POST', '/scan'),
+  lastScan: () => request<LastScanRun | null>('GET', '/scan/last'),
   pauseQueue: () => request<{ paused: boolean }>('POST', '/queue/pause'),
   resumeQueue: () => request<{ paused: boolean }>('POST', '/queue/resume'),
+
+  getConfig: () => request<RuntimeConfig>('GET', '/config'),
+  updateConfig: (updates: Partial<RuntimeConfig> & { plex_token?: string; root_dirs?: string[] }) =>
+    request<RuntimeConfig>('PUT', '/config', updates),
+
+  listOriginals: () => request<OriginalRecord[]>('GET', '/originals'),
+  deleteOriginal: (id: number) => request<void>('DELETE', `/originals/${id}`),
+  restoreOriginal: (id: number, exclude = false) =>
+    request<void>('POST', `/originals/${id}/restore`, { exclude }),
+
+  clearHistory: () => request<{ deleted: number }>('POST', '/jobs/clear'),
+
+  getJobLog: (id: number, n = 20) =>
+    request<{ lines: string[] }>('GET', `/jobs/${id}/log?n=${n}`),
+
+  browseFS: (path: string | undefined, files = false, unrestricted = false) => {
+    const params = new URLSearchParams({ files: files ? '1' : '0' })
+    if (path) params.set('path', path)
+    if (unrestricted) params.set('unrestricted', '1')
+    return request<FSBrowseResult>('GET', `/fs?${params}`)
+  },
 
   login: (password: string) =>
     request<{ token: string }>('POST', '/auth/login', { password }),
@@ -125,6 +209,8 @@ export type SSEEvent = {
   Type: 'progress' | 'done' | 'failed' | 'paused'
   JobID: number
   Progress: number
+  Speed: number  // encode speed relative to realtime; 0 = not yet known
+  FPS: number
   Error?: string
 }
 

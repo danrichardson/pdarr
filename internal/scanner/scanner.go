@@ -30,13 +30,18 @@ type Result struct {
 
 // Scanner walks directories and enqueues qualifying files.
 type Scanner struct {
-	db  *db.DB
-	log *slog.Logger
+	db               *db.DB
+	log              *slog.Logger
+	processedDirName string // directory name to skip during walks (default: ".processed")
 }
 
-// New creates a Scanner.
-func New(database *db.DB, log *slog.Logger) *Scanner {
-	return &Scanner{db: database, log: log}
+// New creates a Scanner. processedDirName is the name of the subdirectory
+// (e.g. ".processed") that holds held originals and should be skipped.
+func New(database *db.DB, processedDirName string, log *slog.Logger) *Scanner {
+	if processedDirName == "" {
+		processedDirName = ".processed"
+	}
+	return &Scanner{db: database, processedDirName: processedDirName, log: log}
 }
 
 // ScanDirectory walks dir and enqueues qualifying files according to the
@@ -63,6 +68,10 @@ func (s *Scanner) ScanDirectory(ctx context.Context, dir *db.Directory) (*Result
 			return ctx.Err()
 		}
 		if d.IsDir() {
+			// Skip the processed directory to avoid walking held originals.
+			if d.Name() == s.processedDirName {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		if !VideoExtensions[strings.ToLower(filepath.Ext(path))] {
@@ -110,13 +119,17 @@ func (s *Scanner) ScanDirectory(ctx context.Context, dir *db.Directory) (*Result
 // maybeEnqueue evaluates a file against directory rules and inserts a pending
 // job if it qualifies. Returns (queued, skipReason, error).
 func (s *Scanner) maybeEnqueue(ctx context.Context, path string, dir *db.Directory) (bool, string, error) {
-	// Skip if already in jobs table with a non-failed status.
-	exists, err := s.db.SourcePathExists(path)
+	// Skip if a non-retriable job already exists for this path.
+	status, err := s.db.SourcePathStatus(path)
 	if err != nil {
 		return false, "", err
 	}
-	if exists {
-		return false, "already queued", nil
+	switch status {
+	case "": // no job yet — proceed
+	case db.JobFailed, db.JobRestored:
+		// Failed or restored files can be re-queued on the next scan.
+	default:
+		return false, string("status:" + status), nil
 	}
 
 	info, err := os.Stat(path)
@@ -141,11 +154,6 @@ func (s *Scanner) maybeEnqueue(ctx context.Context, path string, dir *db.Directo
 	probe, err := probeFile(path)
 	if err != nil {
 		return false, "", fmt.Errorf("probe: %w", err)
-	}
-
-	// Skip already-HEVC files.
-	if strings.EqualFold(probe.codec, "hevc") {
-		return false, "already HEVC", nil
 	}
 
 	// Bitrate check.

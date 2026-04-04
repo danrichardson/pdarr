@@ -1,15 +1,239 @@
 import { useEffect, useState, useCallback } from 'react'
-import { api, type Job } from '../lib/api'
+import { api, type Job, type FSBrowseResult, type FileEntry } from '../lib/api'
 import { useSSE } from '../hooks/useSSE'
 import { Card } from '../components/Card'
 import { StatusBadge } from '../components/StatusBadge'
 import { ProgressBar } from '../components/ProgressBar'
 import { formatBytes, formatDuration, basename } from '../lib/utils'
-import { X } from 'lucide-react'
+import { X, Check, FolderOpen, ChevronLeft, ArrowUpDown } from 'lucide-react'
+
+type SortKey = 'name' | 'size' | 'date'
+
+function codecBadge(codec: string | undefined) {
+  if (!codec) return null
+  const c = codec.toLowerCase()
+  const isEfficient = c.includes('hevc') || c.includes('265') || c.includes('av1') || c.includes('vp9')
+  const label = codec.length > 8 ? codec.slice(0, 8) : codec
+  return (
+    <span className={`text-[10px] px-1 py-0.5 rounded font-medium shrink-0 ${
+      isEfficient ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'
+    }`}>
+      {label}
+    </span>
+  )
+}
+
+function jobStatusPill(status: string | undefined) {
+  if (!status) return null
+  const map: Record<string, string> = {
+    done:      'bg-green-100 text-green-700',
+    pending:   'bg-stone-100 text-stone-500',
+    running:   'bg-amber-100 text-amber-700',
+    failed:    'bg-red-100 text-red-600',
+    cancelled: 'bg-stone-100 text-stone-400',
+    skipped:   'bg-stone-100 text-stone-400',
+  }
+  return (
+    <span className={`text-[10px] px-1 py-0.5 rounded font-medium shrink-0 ${map[status] ?? 'bg-stone-100 text-stone-400'}`}>
+      {status}
+    </span>
+  )
+}
+
+function sortFiles(files: FileEntry[], key: SortKey): FileEntry[] {
+  return [...files].sort((a, b) => {
+    if (key === 'size') return b.size - a.size
+    if (key === 'date') return new Date(b.modified).getTime() - new Date(a.modified).getTime()
+    return a.name.localeCompare(b.name)
+  })
+}
+
+function relDate(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const days = Math.floor(diff / 86400000)
+  if (days === 0) return 'today'
+  if (days === 1) return 'yesterday'
+  if (days < 30) return `${days}d ago`
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`
+  return `${Math.floor(days / 365)}y ago`
+}
+
+// ---- File picker modal ----
+
+function FilePicker({ onSelect, onClose }: { onSelect: (paths: string[]) => void; onClose: () => void }) {
+  const [browse, setBrowse] = useState<FSBrowseResult | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [sort, setSort] = useState<SortKey>('name')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+
+  const navigate = useCallback(async (path: string) => {
+    setLoading(true)
+    setError('')
+    setSelected(new Set())
+    try {
+      setBrowse(await api.browseFS(path, true))
+    } catch (e: any) {
+      setError(e.message || 'Cannot read directory')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { navigate('') }, [navigate])
+
+  const sortedFiles = browse ? sortFiles(browse.files, sort) : []
+  const allSelected = sortedFiles.length > 0 && sortedFiles.every(f => selected.has(f.path))
+
+  const toggleFile = (path: string) => setSelected(prev => {
+    const next = new Set(prev)
+    if (next.has(path)) next.delete(path)
+    else next.add(path)
+    return next
+  })
+
+  const toggleAll = () => {
+    setSelected(allSelected ? new Set() : new Set(sortedFiles.map(f => f.path)))
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200">
+          <h3 className="text-sm font-semibold text-stone-900">Browse for file</h3>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700"><X size={16} /></button>
+        </div>
+        {/* Path + sort + select-all */}
+        <div className="flex items-center justify-between px-4 py-2 bg-stone-50 border-b border-stone-100 gap-3">
+          <p className="text-xs font-mono text-stone-600 truncate flex-1">{browse?.current ?? '/'}</p>
+          {sortedFiles.length > 0 && (
+            <button
+              onClick={toggleAll}
+              className="text-xs text-stone-500 hover:text-stone-800 shrink-0 transition-colors"
+            >
+              {allSelected ? 'Deselect all' : 'Select all'}
+            </button>
+          )}
+          {browse && browse.files.length > 1 && (
+            <div className="flex items-center gap-1 shrink-0">
+              <ArrowUpDown size={11} className="text-stone-400" />
+              {(['name', 'size', 'date'] as SortKey[]).map(k => (
+                <button
+                  key={k}
+                  onClick={() => setSort(k)}
+                  className={`text-xs px-2 py-0.5 rounded transition-colors ${sort === k ? 'bg-stone-800 text-white' : 'text-stone-500 hover:bg-stone-100'}`}
+                >
+                  {k}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {/* List */}
+        <div className="flex-1 overflow-y-auto">
+          {loading ? (
+            <p className="text-sm text-stone-400 text-center py-8">Loading…</p>
+          ) : error ? (
+            <p className="text-sm text-red-600 text-center py-8">{error}</p>
+          ) : (
+            <>
+              {browse?.parent && (
+                <button
+                  onClick={() => navigate(browse.parent)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-stone-600 hover:bg-stone-50 border-b border-stone-100"
+                >
+                  <ChevronLeft size={14} className="text-stone-400" /> Parent directory
+                </button>
+              )}
+              {browse?.dirs.map(dir => (
+                <button
+                  key={dir}
+                  onClick={() => navigate(dir)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-stone-700 hover:bg-stone-50 border-b border-stone-100"
+                >
+                  <FolderOpen size={14} className="text-amber-500 shrink-0" />
+                  <span className="truncate">{basename(dir)}</span>
+                </button>
+              ))}
+              {sortedFiles.map(file => {
+                const isSelected = selected.has(file.path)
+                return (
+                  <button
+                    key={file.path}
+                    onClick={() => toggleFile(file.path)}
+                    className={`w-full flex items-start gap-2.5 px-4 py-2.5 border-b border-stone-100 last:border-0 text-left transition-colors ${
+                      isSelected ? 'bg-amber-50' : 'hover:bg-stone-50'
+                    }`}
+                  >
+                    <div className={`mt-0.5 shrink-0 w-3.5 h-3.5 rounded border flex items-center justify-center transition-colors ${
+                      isSelected ? 'bg-amber-500 border-amber-500' : 'border-stone-300'
+                    }`}>
+                      {isSelected && <Check size={9} className="text-white" strokeWidth={3} />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono text-stone-900 truncate">{file.name}</p>
+                      <div className="flex items-center flex-wrap gap-1.5 mt-0.5">
+                        <span className="text-[11px] text-stone-500">{formatBytes(file.size)}</span>
+                        <span className="text-stone-300 text-[10px]">·</span>
+                        <span className="text-[11px] text-stone-400">{relDate(file.modified)}</span>
+                        {file.duration ? (
+                          <><span className="text-stone-300 text-[10px]">·</span>
+                          <span className="text-[11px] text-stone-400">{formatDuration(file.duration)}</span></>
+                        ) : null}
+                        {file.bitrate ? (
+                          <><span className="text-stone-300 text-[10px]">·</span>
+                          <span className="text-[11px] text-stone-400">{Math.round(file.bitrate / 1000)} kbps</span></>
+                        ) : null}
+                        {file.bytes_saved && file.bytes_saved > 0 ? (
+                          <><span className="text-stone-300 text-[10px]">·</span>
+                          <span className="text-[11px] text-green-600">saved {formatBytes(file.bytes_saved)}</span></>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      {codecBadge(file.codec)}
+                      {jobStatusPill(file.job_status)}
+                    </div>
+                  </button>
+                )
+              })}
+              {browse && browse.dirs.length === 0 && browse.files.length === 0 && (
+                <p className="text-sm text-stone-400 text-center py-6">No video files or subdirectories</p>
+              )}
+            </>
+          )}
+        </div>
+        {/* Footer */}
+        {sortedFiles.length > 0 && (
+          <div className="flex items-center justify-between px-4 py-3 border-t border-stone-200">
+            <span className="text-xs text-stone-400">
+              {selected.size > 0 ? `${selected.size} of ${sortedFiles.length} selected` : 'Click files to select'}
+            </span>
+            <button
+              onClick={() => onSelect([...selected])}
+              disabled={selected.size === 0}
+              className="px-3 py-1.5 text-sm bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-white rounded-md transition-colors"
+            >
+              Queue {selected.size > 1 ? `${selected.size} files` : selected.size === 1 ? '1 file' : '…'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---- Queue page ----
 
 export function Queue() {
   const [running, setRunning] = useState<Job[]>([])
   const [pending, setPending] = useState<Job[]>([])
+  const [manualPath, setManualPath] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState<string | null>(null)
+  const [submitSuccess, setSubmitSuccess] = useState(false)
+  const [showPicker, setShowPicker] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -23,6 +247,25 @@ export function Queue() {
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  const handleManualSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!manualPath.trim()) return
+    setSubmitting(true)
+    setSubmitError(null)
+    setSubmitSuccess(false)
+    try {
+      await api.createJob(manualPath.trim())
+      setManualPath('')
+      setSubmitSuccess(true)
+      setTimeout(() => setSubmitSuccess(false), 3000)
+      load()
+    } catch (err: any) {
+      setSubmitError(err.message || 'Failed to queue file')
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   useSSE((e) => {
     if (e.Type === 'progress') {
@@ -44,7 +287,69 @@ export function Queue() {
 
   return (
     <div className="p-6 space-y-6">
+      {showPicker && (
+        <FilePicker
+          onSelect={async paths => {
+            setShowPicker(false)
+            setSubmitting(true)
+            setSubmitError(null)
+            setSubmitSuccess(false)
+            let failed = 0
+            for (const path of paths) {
+              try { await api.createJob(path) }
+              catch { failed++ }
+            }
+            setSubmitting(false)
+            if (failed > 0) {
+              setSubmitError(`${failed} file${failed > 1 ? 's' : ''} failed to queue`)
+            } else {
+              setSubmitSuccess(true)
+              setTimeout(() => setSubmitSuccess(false), 3000)
+            }
+            load()
+          }}
+          onClose={() => setShowPicker(false)}
+        />
+      )}
+
       <h1 className="text-xl font-semibold text-stone-900">Queue</h1>
+
+      {/* Manual queue form */}
+      <Card>
+        <h2 className="text-sm font-medium text-stone-700 mb-3">Queue a file</h2>
+        <form onSubmit={handleManualSubmit} className="flex gap-2">
+          <input
+            type="text"
+            value={manualPath}
+            onChange={e => setManualPath(e.target.value)}
+            placeholder="/absolute/path/to/file.mkv"
+            className="flex-1 min-w-0 text-sm border border-stone-300 rounded-md px-3 py-1.5 font-mono focus:outline-none focus:ring-2 focus:ring-amber-400"
+          />
+          <button
+            type="button"
+            onClick={() => setShowPicker(true)}
+            className="shrink-0 px-3 py-1.5 text-sm border border-stone-300 text-stone-600 hover:bg-stone-50 rounded-md transition-colors"
+            title="Browse for file"
+          >
+            <FolderOpen size={15} />
+          </button>
+          <button
+            type="submit"
+            disabled={submitting || !manualPath.trim()}
+            className="shrink-0 px-3 py-1.5 text-sm bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white rounded-md transition-colors"
+          >
+            Queue
+          </button>
+        </form>
+        {submitSuccess && (
+          <p className="mt-2 text-xs text-green-700 flex items-center gap-1">
+            <Check size={12} /> Added to queue
+          </p>
+        )}
+        {submitError && (
+          <p className="mt-2 text-xs text-red-600">{submitError}</p>
+        )}
+      </Card>
 
       {running.length > 0 && (
         <section>

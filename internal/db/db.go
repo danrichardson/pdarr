@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -41,8 +42,33 @@ func (db *DB) Conn() *sql.DB {
 }
 
 func (db *DB) migrate() error {
-	_, err := db.conn.Exec(schema)
-	return err
+	if _, err := db.conn.Exec(schema); err != nil {
+		return err
+	}
+	return db.alterations()
+}
+
+// alterations applies idempotent ALTER TABLE statements for columns added after
+// the initial schema. SQLite does not support IF NOT EXISTS on ALTER TABLE, so
+// we ignore "duplicate column" errors.
+func (db *DB) alterations() error {
+	alters := []string{
+		`ALTER TABLE jobs ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range alters {
+		if _, err := db.conn.Exec(stmt); err != nil {
+			// "duplicate column name" is expected on databases that already have it.
+			if !isDuplicateColumn(err) {
+				return fmt.Errorf("alter: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")
 }
 
 const schema = `
@@ -54,7 +80,7 @@ CREATE TABLE IF NOT EXISTS directories (
     path          TEXT    NOT NULL UNIQUE,
     enabled       BOOLEAN NOT NULL DEFAULT 1,
     min_age_days  INTEGER NOT NULL DEFAULT 7,
-    max_bitrate   INTEGER NOT NULL DEFAULT 4000000,
+    max_bitrate   INTEGER NOT NULL DEFAULT 2222000,
     min_size_mb   INTEGER NOT NULL DEFAULT 500,
     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -76,6 +102,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_message   TEXT,
     progress        REAL    NOT NULL DEFAULT 0,
     bytes_saved     INTEGER,
+    fail_count      INTEGER NOT NULL DEFAULT 0,
     started_at      DATETIME,
     finished_at     DATETIME,
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -84,13 +111,19 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_source_path ON jobs(source_path);
 
-CREATE TABLE IF NOT EXISTS quarantine (
+-- originals: holds source files moved aside while the transcoded copy is reviewed.
+-- The original sits at held_path (in the processed dir) until the user deletes it
+-- or the retention period expires.
+CREATE TABLE IF NOT EXISTS originals (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id          INTEGER NOT NULL REFERENCES jobs(id),
-    original_path   TEXT    NOT NULL,
-    quarantine_path TEXT    NOT NULL,
+    original_path   TEXT    NOT NULL,  -- where the file was originally
+    held_path       TEXT    NOT NULL,  -- where the original now lives (processed dir)
+    output_path     TEXT    NOT NULL,  -- where the transcoded file was placed
+    original_size   INTEGER NOT NULL DEFAULT 0,
+    output_size     INTEGER NOT NULL DEFAULT 0,
     expires_at      DATETIME NOT NULL,
-    deleted_at      DATETIME,
+    deleted_at      DATETIME,          -- set when user deletes the original
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

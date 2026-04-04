@@ -41,7 +41,7 @@ func TestScanFindsH264File(t *testing.T) {
 	}
 
 	dbDir, _ := database.GetDirectory(dirID)
-	s := scanner.New(database, testLog(t))
+	s := scanner.New(database, ".processed", testLog(t))
 	result, err := s.ScanDirectory(context.Background(), dbDir)
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,9 @@ func TestScanFindsH264File(t *testing.T) {
 	}
 }
 
-func TestScanSkipsHEVC(t *testing.T) {
+// TestScannerEnqueuesOversizedHEVC verifies that an HEVC file above the bitrate
+// threshold IS enqueued — codec alone must not cause a skip.
+func TestScannerEnqueuesOversizedHEVC(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not on PATH")
 	}
@@ -71,11 +73,12 @@ func TestScanSkipsHEVC(t *testing.T) {
 	database := testutil.NewTestDB(t)
 	dir := t.TempDir()
 
-	clipPath := filepath.Join(dir, "hevc.mkv")
+	// Encode a short HEVC clip at a relatively high bitrate.
+	clipPath := filepath.Join(dir, "hevc_big.mkv")
 	cmd := exec.Command("ffmpeg", "-y",
 		"-f", "lavfi",
-		"-i", "testsrc=duration=5:size=640x480:rate=25",
-		"-c:v", "libx265", "-crf", "28",
+		"-i", "testsrc=duration=10:size=1920x1080:rate=25",
+		"-c:v", "libx265", "-b:v", "8000k",
 		clipPath,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -89,15 +92,95 @@ func TestScanSkipsHEVC(t *testing.T) {
 		Path:       dir,
 		Enabled:    true,
 		MinAgeDays: 7,
-		MaxBitrate: 4_000_000,
+		MaxBitrate: 2_222_000, // 1 GB/hr — clip is well above this
 	})
 	dbDir, _ := database.GetDirectory(dirID)
 
-	s := scanner.New(database, testLog(t))
+	s := scanner.New(database, ".processed", testLog(t))
+	result, _ := s.ScanDirectory(context.Background(), dbDir)
+
+	if result.FilesQueued != 1 {
+		t.Errorf("expected oversized HEVC to be queued, got FilesQueued=%d", result.FilesQueued)
+	}
+}
+
+// TestScannerSkipsUndersizedHEVC verifies that an HEVC file below the bitrate
+// threshold is NOT enqueued (bitrate gate works regardless of codec).
+func TestScannerSkipsUndersizedHEVC(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+
+	database := testutil.NewTestDB(t)
+	dir := t.TempDir()
+
+	clipPath := filepath.Join(dir, "hevc_small.mkv")
+	cmd := exec.Command("ffmpeg", "-y",
+		"-f", "lavfi",
+		"-i", "testsrc=duration=10:size=640x480:rate=25",
+		"-c:v", "libx265", "-crf", "40",
+		clipPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("cannot create HEVC test clip: %v\n%s", err, out)
+	}
+
+	past := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(clipPath, past, past)
+
+	dirID, _ := database.InsertDirectory(&db.Directory{
+		Path:       dir,
+		Enabled:    true,
+		MinAgeDays: 7,
+		MaxBitrate: 2_222_000,
+	})
+	dbDir, _ := database.GetDirectory(dirID)
+
+	s := scanner.New(database, ".processed", testLog(t))
 	result, _ := s.ScanDirectory(context.Background(), dbDir)
 
 	if result.FilesQueued != 0 {
-		t.Errorf("expected 0 queued for HEVC file, got %d", result.FilesQueued)
+		t.Errorf("expected low-bitrate HEVC to be skipped, got FilesQueued=%d", result.FilesQueued)
+	}
+}
+
+// TestScannerEnqueuesOversizedAV1 verifies that AV1 files are subject to the
+// same bitrate gate as any other codec.
+func TestScannerEnqueuesOversizedAV1(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+
+	database := testutil.NewTestDB(t)
+	dir := t.TempDir()
+
+	clipPath := filepath.Join(dir, "av1_big.mkv")
+	cmd := exec.Command("ffmpeg", "-y",
+		"-f", "lavfi",
+		"-i", "testsrc=duration=10:size=1920x1080:rate=25",
+		"-c:v", "libaom-av1", "-b:v", "5000k", "-cpu-used", "8",
+		clipPath,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("cannot create AV1 test clip (libaom-av1 may not be available): %v\n%s", err, out)
+	}
+
+	past := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(clipPath, past, past)
+
+	dirID, _ := database.InsertDirectory(&db.Directory{
+		Path:       dir,
+		Enabled:    true,
+		MinAgeDays: 7,
+		MaxBitrate: 2_222_000,
+	})
+	dbDir, _ := database.GetDirectory(dirID)
+
+	s := scanner.New(database, ".processed", testLog(t))
+	result, _ := s.ScanDirectory(context.Background(), dbDir)
+
+	if result.FilesQueued != 1 {
+		t.Errorf("expected oversized AV1 to be queued, got FilesQueued=%d", result.FilesQueued)
 	}
 }
 
@@ -116,7 +199,7 @@ func TestScanSkipsNewFile(t *testing.T) {
 	})
 	dbDir, _ := database.GetDirectory(dirID)
 
-	s := scanner.New(database, testLog(t))
+	s := scanner.New(database, ".processed", testLog(t))
 	result, _ := s.ScanDirectory(context.Background(), dbDir)
 
 	if result.FilesQueued != 0 {
@@ -139,7 +222,7 @@ func TestScanDeduplicates(t *testing.T) {
 		MaxBitrate: 0, // disabled
 	})
 	dbDir, _ := database.GetDirectory(dirID)
-	s := scanner.New(database, testLog(t))
+	s := scanner.New(database, ".processed", testLog(t))
 
 	s.ScanDirectory(context.Background(), dbDir)
 	result, _ := s.ScanDirectory(context.Background(), dbDir)

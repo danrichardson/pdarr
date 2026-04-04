@@ -14,8 +14,10 @@ import (
 	"time"
 )
 
-// ProgressFunc is called periodically with progress in [0.0, 1.0].
-type ProgressFunc func(progress float64)
+// ProgressFunc is called periodically with progress [0.0,1.0], encode speed
+// relative to realtime (e.g. 3.66 = 3.66× faster), and frames per second.
+// Speed is 0 when ffmpeg has not yet reported it (start of encode).
+type ProgressFunc func(progress, speed, fps float64)
 
 // Transcoder runs ffmpeg jobs using a detected encoder.
 type Transcoder struct {
@@ -37,7 +39,8 @@ func (t *Transcoder) Encoder() *Encoder {
 
 // Run transcodes inputPath to a temp file, returning the temp output path.
 // The caller is responsible for verifying and renaming the output.
-func (t *Transcoder) Run(ctx context.Context, inputPath string, duration float64, onProgress ProgressFunc) (outputPath string, err error) {
+// onLog, if non-nil, is called with each non-metric stderr line (startup info, warnings, errors).
+func (t *Transcoder) Run(ctx context.Context, inputPath string, duration float64, onProgress ProgressFunc, onLog func(string)) (outputPath string, err error) {
 	outputPath = t.tempOutputPath(inputPath)
 
 	// Ensure temp dir exists.
@@ -45,12 +48,7 @@ func (t *Transcoder) Run(ctx context.Context, inputPath string, duration float64
 		return "", fmt.Errorf("create temp dir: %w", err)
 	}
 
-	args := append(t.encoder.BuildArgs(inputPath, outputPath),
-		"-progress", "pipe:2",
-	)
-	// Insert progress pipe before the output path (last arg).
-	// Rebuild: add -progress pipe:2 before final output path arg.
-	args = rebuildWithProgress(t.encoder.BuildArgs(inputPath, outputPath))
+	args := rebuildWithProgress(t.encoder.BuildArgs(inputPath, outputPath))
 
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 
@@ -70,32 +68,128 @@ func (t *Transcoder) Run(ctx context.Context, inputPath string, duration float64
 		return "", fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	// Parse progress from stderr.
+	// Collect stderr while parsing progress. stderrLines is read after stderrDone is closed.
+	var stderrLines []string
+	stderrDone := make(chan struct{})
 	go func() {
-		scanner := bufio.NewScanner(stderr)
-		var currentTime float64
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "out_time_ms=") {
+		defer close(stderrDone)
+		sc := bufio.NewScanner(stderr)
+		sc.Buffer(make([]byte, 256*1024), 256*1024)
+		var currentTime, currentSpeed, currentFPS float64
+		for sc.Scan() {
+			line := sc.Text()
+			stderrLines = append(stderrLines, line)
+
+			// Auto-detect duration from ffmpeg header if caller didn't supply it.
+			if duration == 0 {
+				if d := parseDurationLine(line); d > 0 {
+					duration = d
+				}
+			}
+
+			// Emit diagnostic lines (non-metric) to log consumer.
+			if onLog != nil && isDiagLine(line) {
+				onLog(line)
+			}
+
+			switch {
+			case strings.HasPrefix(line, "out_time_ms="):
 				ms, _ := strconv.ParseFloat(strings.TrimPrefix(line, "out_time_ms="), 64)
 				currentTime = ms / 1_000_000
+			case strings.HasPrefix(line, "speed="):
+				s := strings.TrimPrefix(line, "speed=")
+				s = strings.TrimSuffix(s, "x")
+				if v, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil {
+					currentSpeed = v
+				}
+			case strings.HasPrefix(line, "fps="):
+				if v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "fps=")), 64); err == nil {
+					currentFPS = v
+				}
+			case line == "progress=continue" || line == "progress=end":
 				if duration > 0 && onProgress != nil {
 					pct := currentTime / duration
 					if pct > 1 {
 						pct = 1
 					}
-					onProgress(pct)
+					onProgress(pct, currentSpeed, currentFPS)
 				}
 			}
 		}
 	}()
 
 	if err := cmd.Wait(); err != nil {
+		<-stderrDone
 		os.Remove(outputPath)
+		diag := ffmpegDiagnostic(stderrLines)
+		if diag != "" {
+			return "", fmt.Errorf("ffmpeg: %w\n%s", err, diag)
+		}
 		return "", fmt.Errorf("ffmpeg: %w", err)
 	}
+	<-stderrDone
 
 	return outputPath, nil
+}
+
+// isDiagLine returns true for lines that contain useful diagnostic info
+// (not ffmpeg's -progress pipe:2 key=value metrics).
+func isDiagLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	for _, pfx := range []string{
+		"out_time_ms=", "out_time=", "out_time_us=",
+		"frame=", "fps=", "stream_", "progress=",
+		"speed=", "bitrate=", "total_size=",
+		"dup_frames=", "drop_frames=",
+	} {
+		if strings.HasPrefix(line, pfx) {
+			return false
+		}
+	}
+	return true
+}
+
+// parseDurationLine extracts seconds from ffmpeg's "  Duration: HH:MM:SS.ms, ..." header line.
+var durationLineRx = regexp.MustCompile(`Duration:\s+(\d+):(\d+):(\d+\.\d+)`)
+
+func parseDurationLine(line string) float64 {
+	m := durationLineRx.FindStringSubmatch(line)
+	if m == nil {
+		return 0
+	}
+	h, _ := strconv.ParseFloat(m[1], 64)
+	mn, _ := strconv.ParseFloat(m[2], 64)
+	s, _ := strconv.ParseFloat(m[3], 64)
+	return h*3600 + mn*60 + s
+}
+
+// ffmpegDiagnostic filters progress-only lines and returns the last 30 diagnostic lines.
+func ffmpegDiagnostic(lines []string) string {
+	var diag []string
+	for _, l := range lines {
+		if l == "" ||
+			strings.HasPrefix(l, "out_time_ms=") ||
+			strings.HasPrefix(l, "out_time=") ||
+			strings.HasPrefix(l, "frame=") ||
+			strings.HasPrefix(l, "fps=") ||
+			strings.HasPrefix(l, "stream_") ||
+			strings.HasPrefix(l, "progress=") ||
+			strings.HasPrefix(l, "speed=") ||
+			strings.HasPrefix(l, "bitrate=") ||
+			strings.HasPrefix(l, "total_size=") ||
+			strings.HasPrefix(l, "out_time_us=") ||
+			strings.HasPrefix(l, "dup_frames=") ||
+			strings.HasPrefix(l, "drop_frames=") {
+			continue
+		}
+		diag = append(diag, l)
+	}
+	if len(diag) > 30 {
+		diag = diag[len(diag)-30:]
+	}
+	return strings.Join(diag, "\n")
 }
 
 // rebuildWithProgress inserts -progress pipe:2 into the args before the final output path.

@@ -25,8 +25,11 @@ type ServerConfig struct {
 }
 
 type ScannerConfig struct {
-	IntervalHours      int `toml:"interval_hours"`
-	WorkerConcurrency  int `toml:"worker_concurrency"`
+	IntervalHours     int      `toml:"interval_hours"`
+	WorkerConcurrency int      `toml:"worker_concurrency"`
+	// RootDirs are the filesystem roots the browser and directory picker are
+	// allowed to access. Paths outside these roots are rejected.
+	RootDirs          []string `toml:"root_dirs"`
 }
 
 type TranscoderConfig struct {
@@ -34,10 +37,26 @@ type TranscoderConfig struct {
 }
 
 type SafetyConfig struct {
-	QuarantineEnabled      bool   `toml:"quarantine_enabled"`
-	QuarantineRetentionDays int   `toml:"quarantine_retention_days"`
-	QuarantineDir          string `toml:"quarantine_dir"`
-	DiskFreePauseGB        int    `toml:"disk_free_pause_gb"`
+	// ProcessedDirName is the name of the subdirectory within each root directory
+	// where original files are moved after successful transcoding.
+	// Default: ".processed"
+	ProcessedDirName string `toml:"processed_dir_name"`
+
+	// OriginalsRetentionDays is how long originals are kept before the GC
+	// automatically deletes them. Default: 10.
+	OriginalsRetentionDays int `toml:"originals_retention_days"`
+
+	// FailThreshold is the number of transcode failures for a single file
+	// before it is automatically excluded. Default: 1.
+	FailThreshold int `toml:"fail_threshold"`
+
+	// SystemFailThreshold is the number of consecutive system-wide failures
+	// before the worker is auto-paused. Default: 5.
+	SystemFailThreshold int `toml:"system_fail_threshold"`
+
+	// DeleteConfirmSingle controls whether the UI asks for confirmation before
+	// deleting a single original. Bulk deletes always confirm. Default: false.
+	DeleteConfirmSingle bool `toml:"delete_confirm_single"`
 }
 
 type PlexConfig struct {
@@ -64,9 +83,11 @@ func Defaults() *Config {
 			WorkerConcurrency: 1,
 		},
 		Safety: SafetyConfig{
-			QuarantineEnabled:       true,
-			QuarantineRetentionDays: 10,
-			DiskFreePauseGB:         50,
+			ProcessedDirName:       ".processed",
+			OriginalsRetentionDays: 10,
+			FailThreshold:          1,
+			SystemFailThreshold:    5,
+			DeleteConfirmSingle:    false,
 		},
 	}
 }
@@ -108,12 +129,14 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// QuarantineDir returns the resolved quarantine directory path.
-func (c *Config) QuarantineDir() string {
-	if c.Safety.QuarantineDir != "" {
-		return c.Safety.QuarantineDir
+// ProcessedDirFor returns the processed directory path for a given root directory.
+// Originals are held at <rootDir>/<ProcessedDirName>/<relative_path>.
+func (c *Config) ProcessedDirFor(rootDir string) string {
+	name := c.Safety.ProcessedDirName
+	if name == "" {
+		name = ".processed"
 	}
-	return filepath.Join(c.Server.DataDir, "quarantine")
+	return filepath.Join(rootDir, name)
 }
 
 // DBPath returns the path to the SQLite database file.

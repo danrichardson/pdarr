@@ -1,16 +1,19 @@
 package api
 
 import (
-	"database/sql"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/danrichardson/sqzarr/internal/config"
 	"github.com/danrichardson/sqzarr/internal/db"
 )
 
@@ -22,18 +25,31 @@ func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	diskFreeGB := s.diskFreeGB()
-
-	jsonOK(w, map[string]any{
-		"version":         "1.0.0",
-		"encoder":         s.encoder.DisplayName,
-		"paused":          s.worker.IsPaused(),
-		"total_saved_gb":  float64(stats.TotalBytesSaved) / (1024 * 1024 * 1024),
-		"jobs_done":       stats.TotalJobsDone,
-		"jobs_failed":     stats.TotalJobsFailed,
-		"disk_free_gb":    diskFreeGB,
-		"pause_threshold": s.cfg.Safety.DiskFreePauseGB,
-	})
+	diskFree, diskPath := s.diskFreeGB()
+	cpuPct, gpuMHz, gpuPct := s.sysStats()
+	out := map[string]any{
+		"version":            "1.0.0",
+		"encoder":            s.encoder.DisplayName,
+		"paused":             s.worker.IsPaused(),
+		"total_saved_gb":     float64(stats.TotalBytesSaved) / (1024 * 1024 * 1024),
+		"jobs_done":          stats.TotalJobsDone,
+		"jobs_failed":        stats.TotalJobsFailed,
+		"disk_free_gb": diskFree,
+		"disk_path":    diskPath,
+		"cpu_percent":  cpuPct,
+		"gpu_mhz":            gpuMHz,
+		"gpu_percent":        gpuPct, // -1 = unavailable, use gpu_mhz instead
+	}
+	if s.sched != nil {
+		next := s.sched.NextScanAt()
+		out["next_scan_at"] = next
+		if last := s.sched.LastScanAt(); last != nil {
+			out["last_scan_at"] = last
+		} else {
+			out["last_scan_at"] = nil
+		}
+	}
+	jsonOK(w, out)
 }
 
 // GET /stats
@@ -126,7 +142,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, job)
 }
 
-// DELETE /jobs/{id} — cancel a pending job
+// DELETE /jobs/{id} — cancel a pending or running job
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -138,12 +154,32 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "job not found", http.StatusNotFound)
 		return
 	}
-	if job.Status != db.JobPending {
-		jsonError(w, "only pending jobs can be cancelled", http.StatusBadRequest)
+	switch job.Status {
+	case db.JobPending:
+		s.db.UpdateJobStatus(id, db.JobCancelled, "cancelled by user")
+	case db.JobRunning:
+		// Signal the running ffmpeg process to stop; the worker goroutine
+		// will update the status once it exits.
+		if !s.worker.CancelJob(id) {
+			// Race: job just finished — treat as already done.
+			jsonError(w, "job is no longer running", http.StatusConflict)
+			return
+		}
+	default:
+		jsonError(w, "only pending or running jobs can be cancelled", http.StatusBadRequest)
 		return
 	}
-	s.db.UpdateJobStatus(id, db.JobCancelled, "cancelled by user")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /jobs/clear — delete failed/cancelled/skipped/released jobs from history
+func (s *Server) handleClearHistory(w http.ResponseWriter, r *http.Request) {
+	n, err := s.db.ClearHistory()
+	if err != nil {
+		jsonError(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]int{"deleted": n})
 }
 
 // POST /jobs/{id}/retry
@@ -166,6 +202,26 @@ func (s *Server) handleRetryJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// GET /jobs/{id}/log — recent ffmpeg diagnostic lines for an active job
+func (s *Server) handleGetJobLog(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		jsonError(w, "invalid job id", http.StatusBadRequest)
+		return
+	}
+	n := 20
+	if q := r.URL.Query().Get("n"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil && v > 0 && v <= 200 {
+			n = v
+		}
+	}
+	lines := s.worker.RecentLog(id, n)
+	if lines == nil {
+		lines = []string{}
+	}
+	jsonOK(w, map[string]any{"lines": lines})
+}
+
 // GET /directories
 func (s *Server) handleListDirectories(w http.ResponseWriter, r *http.Request) {
 	dirs, err := s.db.ListDirectories()
@@ -176,25 +232,65 @@ func (s *Server) handleListDirectories(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, dirs)
 }
 
+// validateDirPath checks that path is safe to use as a scan directory:
+// it must exist, be a directory, be writable, and — if root_dirs are configured —
+// fall within one of them.
+func (s *Server) validateDirPath(path string) (string, int) {
+	if path == "" {
+		return "path is required", http.StatusBadRequest
+	}
+	if strings.Contains(path, "..") {
+		return "path must not contain ..", http.StatusBadRequest
+	}
+
+	// Root-dirs constraint: if any roots are configured, path must be within one.
+	if len(s.cfg.Scanner.RootDirs) > 0 {
+		if !pathUnderAnyRoot(path, s.cfg.Scanner.RootDirs) {
+			return "path is outside all configured root directories", http.StatusBadRequest
+		}
+	} else {
+		// No roots configured — refuse to save any directory until roots are set.
+		return "configure root directories in Settings before adding scan directories", http.StatusBadRequest
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "directory does not exist", http.StatusBadRequest
+		}
+		return "cannot access path: " + err.Error(), http.StatusBadRequest
+	}
+	if !fi.IsDir() {
+		return "path is not a directory", http.StatusBadRequest
+	}
+
+	// Writability check: try creating and removing a sentinel file.
+	sentinel := filepath.Join(path, ".sqzarr_write_test")
+	f, err := os.Create(sentinel)
+	if err != nil {
+		return "directory is not writable", http.StatusBadRequest
+	}
+	f.Close()
+	os.Remove(sentinel)
+
+	return "", 0
+}
+
 // POST /directories
 func (s *Server) handleCreateDirectory(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path        string `json:"path"`
-		Enabled     *bool  `json:"enabled"`
-		MinAgeDays  int    `json:"min_age_days"`
-		MaxBitrate  int64  `json:"max_bitrate"`
-		MinSizeMB   int64  `json:"min_size_mb"`
+		Path       string `json:"path"`
+		Enabled    *bool  `json:"enabled"`
+		MinAgeDays int    `json:"min_age_days"`
+		MaxBitrate int64  `json:"max_bitrate"`
+		MinSizeMB  int64  `json:"min_size_mb"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.Path == "" {
-		jsonError(w, "path is required", http.StatusBadRequest)
-		return
-	}
-	if strings.Contains(req.Path, "..") {
-		jsonError(w, "path must not contain ..", http.StatusBadRequest)
+	if msg, code := s.validateDirPath(req.Path); msg != "" {
+		jsonError(w, msg, code)
 		return
 	}
 
@@ -206,7 +302,7 @@ func (s *Server) handleCreateDirectory(w http.ResponseWriter, r *http.Request) {
 		req.MinAgeDays = 7
 	}
 	if req.MaxBitrate == 0 {
-		req.MaxBitrate = 4_000_000
+		req.MaxBitrate = 2_222_000
 	}
 	if req.MinSizeMB == 0 {
 		req.MinSizeMB = 500
@@ -270,8 +366,8 @@ func (s *Server) handleUpdateDirectory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Path != nil {
-		if strings.Contains(*req.Path, "..") {
-			jsonError(w, "path must not contain ..", http.StatusBadRequest)
+		if msg, code := s.validateDirPath(*req.Path); msg != "" {
+			jsonError(w, msg, code)
 			return
 		}
 		d.Path = *req.Path
@@ -324,8 +420,21 @@ func (s *Server) handleTriggerScan(w http.ResponseWriter, r *http.Request) {
 				s.log.Error("scan error", "directory", d.Path, "error", err)
 			}
 		}
+		if s.sched != nil {
+			s.sched.RecordManualScan()
+		}
 	}()
 	jsonOK(w, map[string]string{"status": "scan started"})
+}
+
+// GET /scan/last — most recent completed scan run
+func (s *Server) handleLastScan(w http.ResponseWriter, r *http.Request) {
+	run, err := s.db.LastScanRun()
+	if err != nil || run == nil {
+		jsonOK(w, nil)
+		return
+	}
+	jsonOK(w, run)
 }
 
 // POST /queue/pause
@@ -372,16 +481,423 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"token": token})
 }
 
-func (s *Server) diskFreeGB() float64 {
-	if runtime.GOOS == "windows" {
-		return -1
+// GET /config — returns runtime-editable settings
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	plexToken := ""
+	if s.cfg.Plex.Token != "" {
+		plexToken = "SET"
 	}
-	var stat syscall.Statfs_t
-	dir := s.cfg.Server.DataDir
-	if err := syscall.Statfs(dir, &stat); err != nil {
-		return -1
+	roots := s.cfg.Scanner.RootDirs
+	if roots == nil {
+		roots = []string{}
 	}
-	return float64(stat.Bavail) * float64(stat.Bsize) / (1024 * 1024 * 1024)
+	jsonOK(w, map[string]any{
+		"root_dirs":                  roots,
+		"worker_concurrency":         s.cfg.Scanner.WorkerConcurrency,
+		"scan_interval_hours":        s.cfg.Scanner.IntervalHours,
+		"processed_dir_name":         s.cfg.Safety.ProcessedDirName,
+		"originals_retention_days":   s.cfg.Safety.OriginalsRetentionDays,
+		"fail_threshold":             s.cfg.Safety.FailThreshold,
+		"system_fail_threshold":      s.cfg.Safety.SystemFailThreshold,
+		"delete_confirm_single":      s.cfg.Safety.DeleteConfirmSingle,
+		"plex_enabled":               s.cfg.Plex.Enabled,
+		"plex_base_url":              s.cfg.Plex.BaseURL,
+		"plex_token":                 plexToken,
+	})
 }
 
-var _ = sql.NullInt64{} // ensure database/sql import is used
+// PUT /config — updates runtime-editable settings in memory and on disk
+func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		RootDirs                []string `json:"root_dirs"`
+		WorkerConcurrency       *int     `json:"worker_concurrency"`
+		ScanIntervalHours       *int     `json:"scan_interval_hours"`
+		ProcessedDirName        *string  `json:"processed_dir_name"`
+		OriginalsRetentionDays  *int     `json:"originals_retention_days"`
+		FailThreshold           *int     `json:"fail_threshold"`
+		SystemFailThreshold     *int     `json:"system_fail_threshold"`
+		DeleteConfirmSingle     *bool    `json:"delete_confirm_single"`
+		PlexEnabled             *bool    `json:"plex_enabled"`
+		PlexBaseURL             *string  `json:"plex_base_url"`
+		PlexToken               *string  `json:"plex_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	fileUpdates := map[string]string{}
+
+	if req.RootDirs != nil {
+		// Validate each root: must exist and be a real directory.
+		for _, root := range req.RootDirs {
+			if strings.Contains(root, "..") {
+				jsonError(w, "root_dirs: path must not contain ..: "+root, http.StatusBadRequest)
+				return
+			}
+			fi, err := os.Stat(root)
+			if err != nil {
+				jsonError(w, "root_dirs: "+root+": "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !fi.IsDir() {
+				jsonError(w, "root_dirs: not a directory: "+root, http.StatusBadRequest)
+				return
+			}
+		}
+		s.cfg.Scanner.RootDirs = req.RootDirs
+		// Encode as TOML inline array: ["a", "b"]
+		parts := make([]string, len(req.RootDirs))
+		for i, r := range req.RootDirs {
+			parts[i] = `"` + strings.ReplaceAll(r, `"`, `\"`) + `"`
+		}
+		fileUpdates["root_dirs"] = "[" + strings.Join(parts, ", ") + "]"
+	}
+
+	if req.WorkerConcurrency != nil {
+		n := *req.WorkerConcurrency
+		if n < 1 || n > 8 {
+			jsonError(w, "worker_concurrency must be between 1 and 8", http.StatusBadRequest)
+			return
+		}
+		s.cfg.Scanner.WorkerConcurrency = n
+		s.worker.SetConcurrency(n)
+		fileUpdates["worker_concurrency"] = strconv.Itoa(n)
+	}
+	if req.ScanIntervalHours != nil {
+		hrs := *req.ScanIntervalHours
+		if hrs < 1 {
+			jsonError(w, "scan_interval_hours must be at least 1", http.StatusBadRequest)
+			return
+		}
+		s.cfg.Scanner.IntervalHours = hrs
+		if s.sched != nil {
+			s.sched.SetInterval(hrs)
+		}
+		fileUpdates["interval_hours"] = strconv.Itoa(hrs)
+	}
+	if req.ProcessedDirName != nil {
+		s.cfg.Safety.ProcessedDirName = *req.ProcessedDirName
+		fileUpdates["processed_dir_name"] = `"` + *req.ProcessedDirName + `"`
+	}
+	if req.OriginalsRetentionDays != nil {
+		days := *req.OriginalsRetentionDays
+		if days < 1 {
+			jsonError(w, "originals_retention_days must be at least 1", http.StatusBadRequest)
+			return
+		}
+		s.cfg.Safety.OriginalsRetentionDays = days
+		fileUpdates["originals_retention_days"] = strconv.Itoa(days)
+	}
+	if req.FailThreshold != nil {
+		n := *req.FailThreshold
+		if n < 1 {
+			jsonError(w, "fail_threshold must be at least 1", http.StatusBadRequest)
+			return
+		}
+		s.cfg.Safety.FailThreshold = n
+		fileUpdates["fail_threshold"] = strconv.Itoa(n)
+	}
+	if req.SystemFailThreshold != nil {
+		n := *req.SystemFailThreshold
+		if n < 1 {
+			jsonError(w, "system_fail_threshold must be at least 1", http.StatusBadRequest)
+			return
+		}
+		s.cfg.Safety.SystemFailThreshold = n
+		fileUpdates["system_fail_threshold"] = strconv.Itoa(n)
+	}
+	if req.DeleteConfirmSingle != nil {
+		s.cfg.Safety.DeleteConfirmSingle = *req.DeleteConfirmSingle
+		fileUpdates["delete_confirm_single"] = strconv.FormatBool(*req.DeleteConfirmSingle)
+	}
+	if req.PlexEnabled != nil {
+		s.cfg.Plex.Enabled = *req.PlexEnabled
+		fileUpdates["enabled"] = strconv.FormatBool(*req.PlexEnabled)
+	}
+	if req.PlexBaseURL != nil {
+		s.cfg.Plex.BaseURL = *req.PlexBaseURL
+		fileUpdates["base_url"] = `"` + *req.PlexBaseURL + `"`
+	}
+	if req.PlexToken != nil && *req.PlexToken != "" {
+		s.cfg.Plex.Token = *req.PlexToken
+		fileUpdates["token"] = `"` + *req.PlexToken + `"`
+	}
+
+	if s.cfgPath != "" && len(fileUpdates) > 0 {
+		if err := config.UpdateFile(s.cfgPath, fileUpdates); err != nil {
+			s.log.Warn("could not write config file", "error", err)
+			// Non-fatal: in-memory update already applied.
+		}
+	}
+
+	s.handleGetConfig(w, r)
+}
+
+// GET /originals — list active (non-deleted) original records
+func (s *Server) handleListOriginals(w http.ResponseWriter, r *http.Request) {
+	records, err := s.db.ActiveOriginals()
+	if err != nil {
+		jsonError(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	type row struct {
+		ID           int64     `json:"id"`
+		JobID        int64     `json:"job_id"`
+		OriginalPath string    `json:"original_path"`
+		HeldPath     string    `json:"held_path"`
+		OutputPath   string    `json:"output_path"`
+		OriginalSize int64     `json:"original_size"`
+		OutputSize   int64     `json:"output_size"`
+		ExpiresAt    time.Time `json:"expires_at"`
+		CreatedAt    time.Time `json:"created_at"`
+		DaysRemaining int      `json:"days_remaining"`
+	}
+	out := make([]row, 0, len(records))
+	for _, rec := range records {
+		days := int(time.Until(rec.ExpiresAt).Hours() / 24)
+		if days < 0 {
+			days = 0
+		}
+		out = append(out, row{
+			ID:            rec.ID,
+			JobID:         rec.JobID,
+			OriginalPath:  rec.OriginalPath,
+			HeldPath:      rec.HeldPath,
+			OutputPath:    rec.OutputPath,
+			OriginalSize:  rec.OriginalSize,
+			OutputSize:    rec.OutputSize,
+			ExpiresAt:     rec.ExpiresAt,
+			CreatedAt:     rec.CreatedAt,
+			DaysRemaining: days,
+		})
+	}
+	jsonOK(w, out)
+}
+
+// DELETE /originals/{id} — delete the held original (accept the transcoded version)
+func (s *Server) handleDeleteOriginal(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	rec, err := s.db.GetOriginal(id)
+	if err != nil || rec == nil {
+		jsonError(w, "original record not found", http.StatusNotFound)
+		return
+	}
+	if rerr := os.Remove(rec.HeldPath); rerr != nil && !os.IsNotExist(rerr) {
+		jsonError(w, "failed to delete original file", http.StatusInternalServerError)
+		return
+	}
+	if err := s.db.MarkOriginalDeleted(id); err != nil {
+		jsonError(w, "database error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// POST /originals/{id}/restore — move original back, remove transcoded version,
+// mark job as restored. Optionally exclude the job (body: {"exclude": true}).
+func (s *Server) handleRestoreOriginal(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		jsonError(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	rec, err := s.db.GetOriginal(id)
+	if err != nil || rec == nil {
+		jsonError(w, "original record not found", http.StatusNotFound)
+		return
+	}
+
+	var body struct {
+		Exclude bool `json:"exclude"`
+	}
+	json.NewDecoder(r.Body).Decode(&body) // ignore decode error (body optional)
+
+	// Move original back to its original location.
+	if err := os.MkdirAll(filepath.Dir(rec.OriginalPath), 0o755); err != nil {
+		jsonError(w, "failed to prepare restore path", http.StatusInternalServerError)
+		return
+	}
+	if err := os.Rename(rec.HeldPath, rec.OriginalPath); err != nil {
+		jsonError(w, "failed to restore original file", http.StatusInternalServerError)
+		return
+	}
+
+	// Remove the transcoded output.
+	if rerr := os.Remove(rec.OutputPath); rerr != nil && !os.IsNotExist(rerr) {
+		s.log.Warn("restore: could not remove transcoded file",
+			"path", rec.OutputPath, "error", rerr)
+		// Non-fatal — original is restored, user can delete manually.
+	}
+
+	s.db.MarkOriginalDeleted(id)
+
+	if body.Exclude {
+		s.db.ExcludeJob(rec.JobID, "restored by user and excluded from future scans")
+	} else {
+		s.db.UpdateJobStatus(rec.JobID, db.JobRestored, "original restored by user")
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// videoExtensions is the set of file extensions treated as video files.
+var videoExtensions = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".m4v": true,
+	".mov": true, ".ts": true, ".m2ts": true, ".wmv": true,
+}
+
+// fsFileEntry is returned by GET /fs for each video file.
+type fsFileEntry struct {
+	Path      string    `json:"path"`
+	Name      string    `json:"name"`
+	Size      int64     `json:"size"`
+	Modified  time.Time `json:"modified"`
+	Codec     string    `json:"codec,omitempty"`
+	Bitrate   int64     `json:"bitrate,omitempty"`
+	Duration  float64   `json:"duration,omitempty"`
+	JobStatus string    `json:"job_status,omitempty"`
+	BytesSaved int64   `json:"bytes_saved,omitempty"`
+}
+
+// GET /fs?path=<dir>&files=1&unrestricted=1 — list subdirectories (and optionally video files with metadata)
+// unrestricted=1 bypasses the root-dir ceiling; used only for the root-directory picker in Settings.
+func (s *Server) handleBrowseFS(w http.ResponseWriter, r *http.Request) {
+	reqPath := r.URL.Query().Get("path")
+	showFiles := r.URL.Query().Get("files") == "1"
+	unrestricted := r.URL.Query().Get("unrestricted") == "1"
+
+	// Root dirs from config define the navigation ceiling (unless unrestricted).
+	roots := s.cfg.Scanner.RootDirs
+
+	// Default starting path: first root dir, or / if none configured (or unrestricted).
+	if reqPath == "" {
+		if !unrestricted && len(roots) > 0 {
+			reqPath = roots[0]
+		} else {
+			reqPath = "/"
+		}
+	}
+
+	abs, err := filepath.Abs(reqPath)
+	if err != nil {
+		jsonError(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	// If configured roots exist and the requested path is outside all of them,
+	// redirect to the first root instead of exposing arbitrary filesystem paths.
+	// Skip this check when unrestricted (root-directory picker in Settings).
+	if !unrestricted && len(roots) > 0 && !pathUnderAnyRoot(abs, roots) {
+		abs = roots[0]
+	}
+
+	entries, err := os.ReadDir(abs)
+	if err != nil {
+		jsonError(w, "cannot read directory", http.StatusBadRequest)
+		return
+	}
+
+	dirs := []string{}
+	var filePaths []string
+	var fileEntries []fsFileEntry
+
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if e.IsDir() {
+			dirs = append(dirs, filepath.Join(abs, e.Name()))
+		} else if showFiles && videoExtensions[strings.ToLower(filepath.Ext(e.Name()))] {
+			fullPath := filepath.Join(abs, e.Name())
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			fileEntries = append(fileEntries, fsFileEntry{
+				Path:     fullPath,
+				Name:     e.Name(),
+				Size:     info.Size(),
+				Modified: info.ModTime(),
+			})
+			filePaths = append(filePaths, fullPath)
+		}
+	}
+
+	// Enrich with job metadata in a single query.
+	if len(filePaths) > 0 {
+		jobMeta, _ := s.db.GetJobMetaByPaths(filePaths)
+		if jobMeta != nil {
+			for i := range fileEntries {
+				if m, ok := jobMeta[fileEntries[i].Path]; ok {
+					fileEntries[i].Codec      = m.Codec
+					fileEntries[i].Bitrate    = m.Bitrate
+					fileEntries[i].Duration   = m.Duration
+					fileEntries[i].JobStatus  = m.Status
+					fileEntries[i].BytesSaved = m.BytesSaved
+				}
+			}
+		}
+	}
+
+	if fileEntries == nil {
+		fileEntries = []fsFileEntry{}
+	}
+
+	// Compute parent, clamped so it never goes above a configured root (unless unrestricted).
+	parent := filepath.Dir(abs)
+	if parent == abs {
+		parent = "" // filesystem root — can't go higher
+	} else if !unrestricted && len(roots) > 0 {
+		// Suppress parent if abs is already at a configured root boundary.
+		for _, root := range roots {
+			if abs == root {
+				parent = ""
+				break
+			}
+		}
+	}
+
+	jsonOK(w, map[string]any{
+		"current": abs,
+		"parent":  parent,
+		"dirs":    dirs,
+		"files":   fileEntries,
+	})
+}
+
+// pathUnderAnyRoot returns true if path equals or is inside any of the given roots.
+func pathUnderAnyRoot(path string, roots []string) bool {
+	for _, root := range roots {
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// diskFreeGB returns free GB and the path being measured.
+// Uses the first enabled media directory; falls back to data dir.
+func (s *Server) diskFreeGB() (float64, string) {
+	if runtime.GOOS == "windows" {
+		return -1, ""
+	}
+	checkPath := s.cfg.Server.DataDir
+	dirs, _ := s.db.ListDirectories()
+	for _, d := range dirs {
+		if d.Enabled {
+			checkPath = d.Path
+			break
+		}
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(checkPath, &stat); err != nil {
+		return -1, ""
+	}
+	return float64(stat.Bavail) * float64(stat.Bsize) / (1024 * 1024 * 1024), checkPath
+}
+
