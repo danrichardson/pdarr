@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 
@@ -86,6 +87,13 @@ func runServe(cfgPath string) {
 	}
 	defer database.Close()
 
+	// Reset any jobs that were left in "running" state from a previous unclean shutdown.
+	if n, err := database.ResetRunningJobs(); err != nil {
+		log.Warn("reset running jobs", "error", err)
+	} else if n > 0 {
+		log.Info("reset stale running jobs", "count", n)
+	}
+
 	enc, err := transcoder.Detect()
 	if err != nil {
 		log.Error("detect encoder", "error", err)
@@ -101,21 +109,23 @@ func runServe(cfgPath string) {
 	}
 
 	worker := queue.New(database, cfg, t, plexNotifier, log)
-	scan := scanner.New(database, log)
+	scan := scanner.New(database, cfg.Safety.ProcessedDirName, log)
+	sched := scanner.NewScheduler(scan, database, cfg.Scanner.IntervalHours, log)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	log.Info("pdarr starting", "addr", cfg.Addr(), "data_dir", cfg.Server.DataDir)
 
-	// Start quarantine GC in background.
-	if cfg.Safety.QuarantineEnabled {
-		gc := queue.NewQuarantineGC(database, log)
-		go gc.Run(ctx)
-	}
+	// Start originals GC in background — deletes expired held originals.
+	gc := queue.NewOriginalsGC(database, log)
+	go gc.Run(ctx)
+
+	// Start scan scheduler in background.
+	go sched.Run(ctx)
 
 	// Start HTTP server in background.
-	httpServer := api.New(cfg, database, worker, scan, enc, log)
+	httpServer := api.New(cfg, cfgPath, database, worker, scan, sched, enc, log)
 	go func() {
 		if err := httpServer.Start(ctx); err != nil {
 			log.Error("HTTP server error", "error", err)
@@ -141,7 +151,7 @@ func runScanOnce(cfgPath string, dryRun bool) {
 	}
 	defer database.Close()
 
-	s := scanner.New(database, log)
+	s := scanner.New(database, cfg.Safety.ProcessedDirName, log)
 	dirs, err := database.ListDirectories()
 	if err != nil {
 		log.Error("list directories", "error", err)
@@ -194,39 +204,34 @@ func runRestore(cfgPath string, jobIDStr string) {
 	}
 	defer database.Close()
 
-	job, err := database.GetJob(jobID)
-	if err != nil || job == nil {
-		log.Error("job not found", "job_id", jobID)
+	rec, err := database.GetOriginalByJobID(jobID)
+	if err != nil || rec == nil {
+		log.Error("no original record for job", "job_id", jobID)
 		os.Exit(1)
 	}
 
-	q, err := database.GetQuarantineByJobID(jobID)
-	if err != nil || q == nil {
-		log.Error("no quarantine record for job", "job_id", jobID)
-		os.Exit(1)
-	}
-
-	// Move original back from quarantine to its original path.
-	if err := os.MkdirAll(fmt.Sprintf("%s/..", q.OriginalPath), 0o755); err != nil {
+	// Move original back from the processed dir to its original path.
+	if err := os.MkdirAll(filepath.Dir(rec.OriginalPath), 0o755); err != nil {
 		log.Error("create parent dir", "error", err)
 		os.Exit(1)
 	}
-	if err := os.Rename(q.QuarantinePath, q.OriginalPath); err != nil {
+	if err := os.Rename(rec.HeldPath, rec.OriginalPath); err != nil {
 		log.Error("restore file", "error", err)
 		os.Exit(1)
 	}
 
-	// Remove transcoded file (now at job.SourcePath after replacement).
-	if job.OutputPath.Valid && job.OutputPath.String != q.OriginalPath {
-		os.Remove(job.OutputPath.String)
+	// Remove transcoded file.
+	if rec.OutputPath != "" && rec.OutputPath != rec.OriginalPath {
+		os.Remove(rec.OutputPath)
 	}
 
-	if err := database.UpdateJobStatus(jobID, db.JobCancelled, "restored from quarantine"); err != nil {
+	database.MarkOriginalDeleted(rec.ID)
+	if err := database.UpdateJobStatus(jobID, db.JobRestored, "restored via CLI"); err != nil {
 		log.Error("update job status", "error", err)
 		os.Exit(1)
 	}
 
-	log.Info("restore complete", "job_id", jobID, "path", q.OriginalPath)
+	log.Info("restore complete", "job_id", jobID, "path", rec.OriginalPath)
 }
 
 func runHashPassword() {

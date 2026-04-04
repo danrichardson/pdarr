@@ -79,9 +79,20 @@ func (db *DB) UpdateDirectory(d *Directory) error {
 }
 
 func (db *DB) DeleteDirectory(id int64) error {
-	_, err := db.conn.Exec(`DELETE FROM directories WHERE id = ?`, id)
+	tx, err := db.conn.Begin()
 	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	// Null out FK references so job/scan history is preserved.
+	if _, err := tx.Exec(`UPDATE jobs SET directory_id = NULL WHERE directory_id = ?`, id); err != nil {
+		return fmt.Errorf("unlink jobs: %w", err)
+	}
+	if _, err := tx.Exec(`UPDATE scan_runs SET directory_id = NULL WHERE directory_id = ?`, id); err != nil {
+		return fmt.Errorf("unlink scan_runs: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM directories WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("delete directory: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }

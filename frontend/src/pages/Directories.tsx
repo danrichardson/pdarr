@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
-import { api, type Directory, type DirectoryInput } from '../lib/api'
-import { formatBitrate } from '../lib/utils'
-import { Plus, Pencil, Trash2, X, Check } from 'lucide-react'
+import { api, type Directory, type DirectoryInput, type FSBrowseResult } from '../lib/api'
+import { formatBitrate, basename } from '../lib/utils'
+import { Plus, Pencil, Trash2, X, Check, FolderOpen, ChevronLeft } from 'lucide-react'
 
 interface DirForm extends Required<DirectoryInput> {
   path: string
@@ -11,9 +11,112 @@ const defaultForm: DirForm = {
   path: '',
   enabled: true,
   min_age_days: 7,
-  max_bitrate: 4_000_000,
+  max_bitrate: 2_222_000,
   min_size_mb: 500,
 }
+
+// ---- Directory browser modal ----
+
+interface BrowserProps {
+  onSelect: (path: string) => void
+  onClose: () => void
+  startPath?: string  // initial directory; defaults to server-side first root
+}
+
+function DirectoryBrowser({ onSelect, onClose, startPath }: BrowserProps) {
+  const [browse, setBrowse] = useState<FSBrowseResult | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const navigate = useCallback(async (path: string) => {
+    setLoading(true)
+    setError('')
+    try {
+      const result = await api.browseFS(path)
+      setBrowse(result)
+    } catch (e: any) {
+      setError(e.message || 'Cannot read directory')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  // Open at the first configured root (via server default) or an explicit startPath.
+  useEffect(() => { navigate(startPath ?? '') }, [navigate, startPath])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-md mx-4 flex flex-col max-h-[70vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-stone-200">
+          <h3 className="text-sm font-semibold text-stone-900">Browse for directory</h3>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Current path */}
+        <div className="px-4 py-2 bg-stone-50 border-b border-stone-100">
+          <p className="text-xs font-mono text-stone-600 truncate">{browse?.current ?? '/'}</p>
+        </div>
+
+        {/* Directory list */}
+        <div className="flex-1 overflow-y-auto">
+          {loading ? (
+            <p className="text-sm text-stone-400 text-center py-8">Loading…</p>
+          ) : error ? (
+            <p className="text-sm text-red-600 text-center py-8">{error}</p>
+          ) : (
+            <>
+              {browse?.parent && (
+                <button
+                  onClick={() => navigate(browse.parent)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-stone-600 hover:bg-stone-50 border-b border-stone-100"
+                >
+                  <ChevronLeft size={14} className="text-stone-400" />
+                  Parent directory
+                </button>
+              )}
+              {browse?.dirs.length === 0 && (
+                <p className="text-sm text-stone-400 text-center py-6">No subdirectories</p>
+              )}
+              {browse?.dirs.map(dir => (
+                <button
+                  key={dir}
+                  onClick={() => navigate(dir)}
+                  className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-stone-700 hover:bg-stone-50 border-b border-stone-100 last:border-0"
+                >
+                  <FolderOpen size={14} className="text-amber-500 shrink-0" />
+                  <span className="truncate">{basename(dir)}</span>
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between gap-2 px-4 py-3 border-t border-stone-200">
+          <button
+            onClick={() => browse?.parent && navigate(browse.parent)}
+            disabled={!browse?.parent}
+            className="flex items-center gap-1 text-sm text-stone-600 hover:text-stone-900 disabled:opacity-40 transition-colors"
+          >
+            <ChevronLeft size={14} /> Parent
+          </button>
+          <button
+            onClick={() => browse && onSelect(browse.current)}
+            disabled={!browse}
+            className="px-3 py-1.5 text-sm bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white rounded-md transition-colors"
+          >
+            Select This Folder
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---- Main page ----
 
 export function Directories() {
   const [dirs, setDirs] = useState<Directory[]>([])
@@ -21,6 +124,7 @@ export function Directories() {
   const [adding, setAdding] = useState(false)
   const [form, setForm] = useState<DirForm>(defaultForm)
   const [error, setError] = useState('')
+  const [showBrowser, setShowBrowser] = useState(false)
 
   const load = useCallback(async () => {
     try { setDirs(await api.listDirectories() ?? []) } catch {}
@@ -70,11 +174,24 @@ export function Directories() {
     try {
       await api.deleteDirectory(id)
       await load()
-    } catch {}
+    } catch (e: any) {
+      setError(e.message || 'Delete failed')
+    }
   }
 
   return (
     <div className="p-6 space-y-6">
+      {showBrowser && (
+        <DirectoryBrowser
+          onSelect={path => {
+            setForm(f => ({ ...f, path }))
+            setShowBrowser(false)
+          }}
+          onClose={() => setShowBrowser(false)}
+          startPath={dirs.find(d => d.Enabled)?.Path ?? dirs[0]?.Path}
+        />
+      )}
+
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-stone-900">Directories</h1>
         {!adding && !editing && (
@@ -97,13 +214,23 @@ export function Directories() {
           <div className="space-y-3">
             <label className="block">
               <span className="text-xs font-medium text-stone-600">Path</span>
-              <input
-                type="text"
-                value={form.path}
-                onChange={e => setForm(f => ({ ...f, path: e.target.value }))}
-                placeholder="/media/Videos"
-                className="mt-1 block w-full rounded-md border border-stone-300 px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:ring-amber-500 focus:outline-none"
-              />
+              <div className="mt-1 flex gap-2">
+                <input
+                  type="text"
+                  value={form.path}
+                  onChange={e => setForm(f => ({ ...f, path: e.target.value }))}
+                  placeholder="/media/Videos"
+                  className="flex-1 min-w-0 rounded-md border border-stone-300 px-3 py-2 text-sm text-stone-900 focus:border-amber-500 focus:ring-amber-500 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowBrowser(true)}
+                  className="shrink-0 flex items-center gap-1 px-3 py-2 text-sm border border-stone-300 rounded-md text-stone-600 hover:bg-stone-50 transition-colors"
+                  title="Browse filesystem"
+                >
+                  <FolderOpen size={14} />
+                </button>
+              </div>
             </label>
 
             <div className="grid grid-cols-3 gap-3">

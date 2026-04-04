@@ -4,7 +4,7 @@
 [server]
 host = "127.0.0.1"   # change to 0.0.0.0 for Tailscale/LAN access
 port = 8080
-data_dir = "/var/lib/pdarr"   # where pdarr.db and quarantine live
+data_dir = "/var/lib/pdarr"   # where pdarr.db lives
 
 [scanner]
 interval_hours = 6            # how often to scan directories
@@ -15,10 +15,22 @@ worker_concurrency = 1        # parallel transcode workers (max 8; GPU usually h
                                # default: same directory as source file
 
 [safety]
-quarantine_enabled = true
-quarantine_retention_days = 10  # days before original is permanently deleted
-# quarantine_dir = ""           # default: {data_dir}/quarantine/
-disk_free_pause_gb = 50         # pause queue when free space drops below this
+# Name of the subdirectory within each root dir where originals are held.
+# A leading dot makes it hidden on Linux/macOS.
+processed_dir_name = ".processed"
+
+# Days before held originals are automatically deleted by the GC.
+originals_retention_days = 10
+
+# Number of transcode failures before a file is permanently excluded.
+fail_threshold = 1
+
+# Number of consecutive system-wide failures before the queue auto-pauses.
+system_fail_threshold = 5
+
+# Require confirmation before deleting a single original in the UI.
+# Bulk deletes always confirm.
+delete_confirm_single = false
 
 [plex]
 enabled = false

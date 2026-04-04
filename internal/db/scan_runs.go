@@ -27,6 +27,25 @@ func (db *DB) InsertScanRun(dirID sql.NullInt64) (int64, error) {
 	return res.LastInsertId()
 }
 
+// LastScanRun returns the most recently completed scan_run row, or nil if none.
+func (db *DB) LastScanRun() (*ScanRun, error) {
+	s := &ScanRun{}
+	err := db.conn.QueryRow(`
+		SELECT id, directory_id, files_scanned, files_queued, files_skipped,
+		       duration_ms, error, started_at, finished_at
+		FROM scan_runs
+		WHERE finished_at IS NOT NULL
+		ORDER BY finished_at DESC
+		LIMIT 1`).Scan(
+		&s.ID, &s.DirectoryID, &s.FilesScanned, &s.FilesQueued, &s.FilesSkipped,
+		&s.DurationMS, &s.Error, &s.StartedAt, &s.FinishedAt)
+	if err != nil {
+		// No rows is a normal case on a fresh install.
+		return nil, nil
+	}
+	return s, nil
+}
+
 func (db *DB) FinishScanRun(id int64, scanned, queued, skipped int, durationMS int64, errMsg string) error {
 	var errVal any
 	if errMsg != "" {

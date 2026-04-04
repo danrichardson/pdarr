@@ -3,17 +3,19 @@ package queue
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/danrichardson/pdarr/internal/config"
 	"github.com/danrichardson/pdarr/internal/db"
+	"github.com/danrichardson/pdarr/internal/rename"
 	"github.com/danrichardson/pdarr/internal/transcoder"
 	"github.com/danrichardson/pdarr/internal/verifier"
 )
@@ -33,6 +35,8 @@ type Event struct {
 	Type     EventType
 	JobID    int64
 	Progress float64
+	Speed    float64 // encode speed relative to realtime (e.g. 3.66 = 3.66×); 0 = unknown
+	FPS      float64 // output frames per second; 0 = unknown
 	Error    string
 }
 
@@ -44,6 +48,8 @@ type PlexNotifier interface {
 	NotifyFileReplaced(path string)
 }
 
+const maxJobLog = 100 // max stderr lines kept per active job
+
 // Worker processes transcode jobs from the database queue.
 type Worker struct {
 	db         *db.DB
@@ -52,20 +58,45 @@ type Worker struct {
 	plex       PlexNotifier
 	log        *slog.Logger
 
-	mu        sync.RWMutex
-	observers []Observer
-	paused    bool
+	mu             sync.RWMutex
+	observers      []Observer
+	paused         bool
+	activeJobs     atomic.Int32
+	maxConcurrency atomic.Int32
+	cancels        map[int64]context.CancelFunc // per-job cancel funcs
+
+	logBufMu sync.Mutex
+	logBuf   map[int64][]string // recent diagnostic lines per active job
 }
 
 // New creates a Worker.
 func New(database *db.DB, cfg *config.Config, enc *transcoder.Transcoder, plex PlexNotifier, log *slog.Logger) *Worker {
-	return &Worker{
+	w := &Worker{
 		db:         database,
 		cfg:        cfg,
 		transcoder: enc,
 		plex:       plex,
 		log:        log,
+		cancels:    make(map[int64]context.CancelFunc),
+		logBuf:     make(map[int64][]string),
 	}
+	concurrency := cfg.Scanner.WorkerConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	w.maxConcurrency.Store(int32(concurrency))
+	return w
+}
+
+// SetConcurrency updates the maximum number of concurrent transcode jobs.
+func (w *Worker) SetConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > 8 {
+		n = 8
+	}
+	w.maxConcurrency.Store(int32(n))
 }
 
 // Subscribe registers an observer for job events.
@@ -89,6 +120,45 @@ func (w *Worker) SetPaused(paused bool) {
 	w.mu.Unlock()
 }
 
+// appendLog adds a log line to the ring buffer for a job.
+func (w *Worker) appendLog(jobID int64, line string) {
+	w.logBufMu.Lock()
+	defer w.logBufMu.Unlock()
+	buf := append(w.logBuf[jobID], line)
+	if len(buf) > maxJobLog {
+		buf = buf[len(buf)-maxJobLog:]
+	}
+	w.logBuf[jobID] = buf
+}
+
+// RecentLog returns up to n recent diagnostic log lines for a job.
+func (w *Worker) RecentLog(jobID int64, n int) []string {
+	w.logBufMu.Lock()
+	defer w.logBufMu.Unlock()
+	buf := w.logBuf[jobID]
+	if len(buf) == 0 {
+		return nil
+	}
+	if n <= 0 || n > len(buf) {
+		n = len(buf)
+	}
+	out := make([]string, n)
+	copy(out, buf[len(buf)-n:])
+	return out
+}
+
+// CancelJob cancels an actively running job by ID.
+func (w *Worker) CancelJob(id int64) bool {
+	w.mu.Lock()
+	cancel, ok := w.cancels[id]
+	w.mu.Unlock()
+	if !ok {
+		return false
+	}
+	cancel()
+	return true
+}
+
 // Run starts the worker loop. It blocks until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) {
 	w.log.Info("worker started")
@@ -110,159 +180,281 @@ func (w *Worker) tick(ctx context.Context) error {
 		return nil
 	}
 
-	if err := w.checkDiskSpace(); err != nil {
-		w.log.Warn("disk space guard triggered, pausing queue", "error", err)
-		w.SetPaused(true)
-		w.emit(Event{Type: EventPaused, Error: err.Error()})
-		return nil
-	}
+	for {
+		active := w.activeJobs.Load()
+		max := w.maxConcurrency.Load()
+		if active >= max {
+			return nil
+		}
 
-	job, err := w.db.NextPendingJob()
-	if err != nil {
-		return fmt.Errorf("next job: %w", err)
-	}
-	if job == nil {
-		return nil
-	}
+		job, err := w.db.NextPendingJob()
+		if err != nil {
+			return fmt.Errorf("next job: %w", err)
+		}
+		if job == nil {
+			return nil
+		}
 
-	return w.processJob(ctx, job)
+		// Per-job temp space check — skip rather than pause the queue.
+		ok, err := hasTempSpace(job.SourcePath, w.cfg.Transcoder.TempDir)
+		if err != nil || !ok {
+			needed := "unknown"
+			if fi, serr := os.Stat(job.SourcePath); serr == nil {
+				needed = fmt.Sprintf("%.1f GB", float64(fi.Size())*1.2/(1024*1024*1024))
+			}
+			w.log.Warn("skipping job: insufficient temp space",
+				"job_id", job.ID, "path", job.SourcePath, "need", needed)
+			w.db.UpdateJobStatus(job.ID, db.JobSkipped, "insufficient temp space")
+			continue
+		}
+
+		// Claim the job atomically before spawning.
+		if err := w.db.UpdateJobStatus(job.ID, db.JobRunning, ""); err != nil {
+			return fmt.Errorf("set running: %w", err)
+		}
+		jobCtx, jobCancel := context.WithCancel(ctx)
+		w.mu.Lock()
+		w.cancels[job.ID] = jobCancel
+		w.mu.Unlock()
+
+		w.activeJobs.Add(1)
+		go func(j *db.Job, jctx context.Context, jcancel context.CancelFunc) {
+			defer func() {
+				jcancel()
+				w.mu.Lock()
+				delete(w.cancels, j.ID)
+				w.mu.Unlock()
+				w.activeJobs.Add(-1)
+				// Retain log buffer briefly so the UI can do a final read.
+				jID := j.ID
+				time.AfterFunc(30*time.Second, func() {
+					w.logBufMu.Lock()
+					delete(w.logBuf, jID)
+					w.logBufMu.Unlock()
+				})
+			}()
+			w.processJob(jctx, j)
+		}(job, jobCtx, jobCancel)
+	}
 }
 
-func (w *Worker) processJob(ctx context.Context, job *db.Job) error {
+// processJob runs a job that has already been claimed (status = running).
+func (w *Worker) processJob(ctx context.Context, job *db.Job) {
 	w.log.Info("starting job", "job_id", job.ID, "source", job.SourcePath)
 
-	if err := w.db.UpdateJobStatus(job.ID, db.JobRunning, ""); err != nil {
-		return fmt.Errorf("set running: %w", err)
-	}
-
-	onProgress := func(p float64) {
+	onProgress := func(p, speed, fps float64) {
 		w.db.UpdateJobProgress(job.ID, p)
-		w.emit(Event{Type: EventProgress, JobID: job.ID, Progress: p})
+		w.emit(Event{Type: EventProgress, JobID: job.ID, Progress: p, Speed: speed, FPS: fps})
 	}
+	onLog := func(line string) { w.appendLog(job.ID, line) }
 
-	outputPath, err := w.transcoder.Run(ctx, job.SourcePath, job.SourceDuration, onProgress)
+	outputPath, err := w.transcoder.Run(ctx, job.SourcePath, job.SourceDuration, onProgress, onLog)
 	if err != nil {
-		w.log.Error("transcode failed", "job_id", job.ID, "error", err)
-		w.db.UpdateJobStatus(job.ID, db.JobFailed, err.Error())
-		w.db.RecordJobFailed()
-		w.emit(Event{Type: EventFailed, JobID: job.ID, Error: err.Error()})
-		return nil
+		if ctx.Err() != nil {
+			w.log.Info("job cancelled", "job_id", job.ID)
+			w.db.UpdateJobStatus(job.ID, db.JobCancelled, "cancelled by user")
+			w.emit(Event{Type: EventFailed, JobID: job.ID, Error: "cancelled"})
+		} else {
+			w.log.Error("transcode failed", "job_id", job.ID, "error", err)
+			w.handleFailure(job, err.Error())
+		}
+		return
 	}
 
-	// Verify output.
+	// Verify output before touching the original.
 	result, err := verifier.Verify(job.SourcePath, outputPath, 1.0)
 	if err != nil {
 		os.Remove(outputPath)
 		w.log.Error("verify error", "job_id", job.ID, "error", err)
-		w.db.UpdateJobStatus(job.ID, db.JobFailed, err.Error())
-		w.db.RecordJobFailed()
-		w.emit(Event{Type: EventFailed, JobID: job.ID, Error: err.Error()})
-		return nil
+		w.handleFailure(job, err.Error())
+		return
 	}
 	if !result.OK {
 		os.Remove(outputPath)
 		w.log.Error("verify failed", "job_id", job.ID, "reason", result.Reason)
-		w.db.UpdateJobStatus(job.ID, db.JobFailed, result.Reason)
-		w.db.RecordJobFailed()
-		w.emit(Event{Type: EventFailed, JobID: job.ID, Error: result.Reason})
-		return nil
-	}
-
-	// Quarantine original before replacing.
-	if w.cfg.Safety.QuarantineEnabled {
-		if err := w.quarantine(job); err != nil {
-			os.Remove(outputPath)
-			w.log.Error("quarantine failed", "job_id", job.ID, "error", err)
-			w.db.UpdateJobStatus(job.ID, db.JobFailed, err.Error())
-			w.db.RecordJobFailed()
-			w.emit(Event{Type: EventFailed, JobID: job.ID, Error: err.Error()})
-			return nil
+		if result.Uncompressible {
+			// File won't benefit from re-encoding — exclude permanently.
+			w.db.ExcludeJob(job.ID, "uncompressible: "+result.Reason)
+			w.emit(Event{Type: EventFailed, JobID: job.ID, Error: result.Reason})
+			return
 		}
+		w.handleFailure(job, result.Reason)
+		return
 	}
 
-	// Replace original with transcoded output (atomic on same filesystem).
-	if err := os.Rename(outputPath, job.SourcePath); err != nil {
-		w.log.Error("rename failed", "job_id", job.ID, "error", err)
-		w.db.UpdateJobStatus(job.ID, db.JobFailed, err.Error())
-		w.db.RecordJobFailed()
-		w.emit(Event{Type: EventFailed, JobID: job.ID, Error: err.Error()})
-		return nil
+	// Compute the new output filename with codec token replacement.
+	newName := rename.OutputName(filepath.Base(job.SourcePath))
+	finalOutputPath := rename.OutputPath(
+		filepath.Dir(job.SourcePath), newName, rename.FileExists)
+
+	// Rename the temp output to the final codec-aware name.
+	if err := os.Rename(outputPath, finalOutputPath); err != nil {
+		os.Remove(outputPath)
+		w.log.Error("rename output failed", "job_id", job.ID, "error", err)
+		w.handleFailure(job, "rename output: "+err.Error())
+		return
 	}
 
+	// Move original to processed dir (mirrored path structure).
+	heldPath, err := w.moveToProcessed(job)
+	if err != nil {
+		// Rollback: remove the transcoded file we already placed.
+		os.Remove(finalOutputPath)
+		w.log.Error("move to processed failed", "job_id", job.ID, "error", err)
+		w.handleFailure(job, "move to processed: "+err.Error())
+		return
+	}
+
+	// Record the staged state.
 	bytesSaved := result.InputSize - result.OutputSize
 	encoderName := string(w.transcoder.Encoder().Type)
 
-	if err := w.db.CompleteJob(job.ID, job.SourcePath, result.OutputSize, encoderName, bytesSaved); err != nil {
-		return fmt.Errorf("complete job in db: %w", err)
+	retentionDays := w.cfg.Safety.OriginalsRetentionDays
+	if retentionDays < 1 {
+		retentionDays = 10
 	}
-	w.db.RecordJobDone(bytesSaved)
+	expiresAt := time.Now().Add(time.Duration(retentionDays) * 24 * time.Hour)
 
-	w.log.Info("job complete",
+	if _, err := w.db.InsertOriginal(&db.OriginalRecord{
+		JobID:        job.ID,
+		OriginalPath: job.SourcePath,
+		HeldPath:     heldPath,
+		OutputPath:   finalOutputPath,
+		OriginalSize: result.InputSize,
+		OutputSize:   result.OutputSize,
+		ExpiresAt:    expiresAt,
+	}); err != nil {
+		w.log.Error("insert original record failed", "job_id", job.ID, "error", err)
+		// Non-fatal: the files are in the right place; just mark staged.
+	}
+
+	if err := w.db.StageJob(job.ID, finalOutputPath, result.OutputSize, encoderName, bytesSaved); err != nil {
+		w.log.Error("stage job in db", "job_id", job.ID, "error", err)
+	}
+
+	w.log.Info("job staged",
 		"job_id", job.ID,
+		"output", finalOutputPath,
+		"held", heldPath,
 		"bytes_saved", bytesSaved,
-		"encoder", encoderName,
 	)
 	w.emit(Event{Type: EventDone, JobID: job.ID, Progress: 1.0})
 
-	// Notify Plex — non-fatal.
+	// Notify Plex of the new file — non-fatal.
 	if w.plex != nil {
-		go w.plex.NotifyFileReplaced(job.SourcePath)
+		go w.plex.NotifyFileReplaced(finalOutputPath)
 	}
-
-	return nil
 }
 
-func (w *Worker) quarantine(job *db.Job) error {
-	quarantineDir := w.cfg.QuarantineDir()
-
-	// Preserve directory hierarchy relative to any configured media root.
-	// We use the source path directly, stripping the leading separator.
-	relPath := strings.TrimPrefix(job.SourcePath, string(filepath.Separator))
-	destPath := filepath.Join(quarantineDir, relPath)
-
-	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
-		return fmt.Errorf("create quarantine dir: %w", err)
+// handleFailure increments the fail counter for a job and either excludes it
+// (if the per-file threshold is reached) or marks it failed. It also checks
+// whether the system-level consecutive failure threshold has been hit.
+func (w *Worker) handleFailure(job *db.Job, reason string) {
+	failCount, err := w.db.IncrementFailCount(job.ID)
+	if err != nil {
+		w.log.Error("increment fail count", "job_id", job.ID, "error", err)
+		failCount = job.FailCount + 1
 	}
 
-	// Copy rather than move so that if the subsequent rename fails we still
-	// have the original in place.
-	if err := copyFile(job.SourcePath, destPath); err != nil {
-		return fmt.Errorf("copy to quarantine: %w", err)
+	threshold := w.cfg.Safety.FailThreshold
+	if threshold < 1 {
+		threshold = 1
 	}
 
-	expiresAt := time.Now().Add(time.Duration(w.cfg.Safety.QuarantineRetentionDays) * 24 * time.Hour)
-	rec := &db.QuarantineRecord{
-		JobID:          job.ID,
-		OriginalPath:   job.SourcePath,
-		QuarantinePath: destPath,
-		ExpiresAt:      expiresAt,
+	if failCount >= threshold {
+		w.log.Warn("excluding job after repeated failures",
+			"job_id", job.ID, "fail_count", failCount, "reason", reason)
+		w.db.ExcludeJob(job.ID, reason)
+	} else {
+		w.db.UpdateJobStatus(job.ID, db.JobFailed, reason)
 	}
-	_, err := w.db.InsertQuarantine(rec)
-	return err
+
+	w.emit(Event{Type: EventFailed, JobID: job.ID, Error: reason})
+
+	// Check system-level consecutive failure threshold.
+	sysThreshold := w.cfg.Safety.SystemFailThreshold
+	if sysThreshold < 1 {
+		sysThreshold = 5
+	}
+	consecFails, err := w.db.ConsecutiveFailCount()
+	if err != nil {
+		return
+	}
+	if consecFails >= sysThreshold {
+		w.log.Warn("auto-pausing: too many consecutive failures",
+			"consecutive_fails", consecFails, "threshold", sysThreshold)
+		w.SetPaused(true)
+		w.emit(Event{Type: EventPaused})
+	}
 }
 
-func (w *Worker) checkDiskSpace() error {
-	threshold := int64(w.cfg.Safety.DiskFreePauseGB) * 1024 * 1024 * 1024
-	if threshold <= 0 {
-		return nil
+// moveToProcessed moves the source file to the processed directory, mirroring
+// the path structure relative to the closest configured root directory.
+// Returns the new held path.
+func (w *Worker) moveToProcessed(job *db.Job) (string, error) {
+	rootDir := w.findRootDir(job.SourcePath)
+	processedDir := w.cfg.ProcessedDirFor(rootDir)
+
+	rel, err := filepath.Rel(rootDir, job.SourcePath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		// Fallback: use basename only.
+		rel = filepath.Base(job.SourcePath)
+	}
+	heldPath := filepath.Join(processedDir, rel)
+
+	if err := os.MkdirAll(filepath.Dir(heldPath), 0o755); err != nil {
+		return "", fmt.Errorf("create processed dir: %w", err)
+	}
+	if err := os.Rename(job.SourcePath, heldPath); err != nil {
+		return "", fmt.Errorf("move original: %w", err)
+	}
+	return heldPath, nil
+}
+
+// findRootDir returns the longest configured directory path that is a prefix
+// of sourcePath. Falls back to the source file's parent directory.
+func (w *Worker) findRootDir(sourcePath string) string {
+	dirs, _ := w.db.ListDirectories()
+	best := ""
+	for _, d := range dirs {
+		prefix := d.Path
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+		if strings.HasPrefix(sourcePath, prefix) && len(d.Path) > len(best) {
+			best = d.Path
+		}
+	}
+	if best == "" {
+		return filepath.Dir(sourcePath)
+	}
+	return best
+}
+
+// hasTempSpace checks whether the partition holding the temp output file has
+// at least 120% of the source file size available.
+func hasTempSpace(sourcePath, tempDir string) (bool, error) {
+	if runtime.GOOS != "linux" {
+		return true, nil
 	}
 
-	checkDir := w.cfg.Safety.QuarantineDir
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	needed := uint64(float64(info.Size()) * 1.2)
+
+	checkDir := tempDir
 	if checkDir == "" {
-		checkDir = w.cfg.Server.DataDir
+		checkDir = filepath.Dir(sourcePath)
 	}
 
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(checkDir, &stat); err != nil {
-		return nil // Can't check — don't block.
+		return true, nil // Can't check — don't block.
 	}
-
-	free := int64(stat.Bavail) * stat.Bsize
-	if free < threshold {
-		return fmt.Errorf("free disk space %d GB below threshold %d GB",
-			free/(1024*1024*1024), w.cfg.Safety.DiskFreePauseGB)
-	}
-	return nil
+	free := stat.Bavail * uint64(stat.Bsize)
+	return free >= needed, nil
 }
 
 func (w *Worker) emit(e Event) {
@@ -274,35 +466,4 @@ func (w *Worker) emit(e Event) {
 	for _, o := range obs {
 		o(e)
 	}
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	buf := make([]byte, 4*1024*1024) // 4 MB buffer
-	for {
-		n, err := in.Read(buf)
-		if n > 0 {
-			if _, werr := out.Write(buf[:n]); werr != nil {
-				return werr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
-	}
-	return out.Sync()
 }

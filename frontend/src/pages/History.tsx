@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { api, type Job } from '../lib/api'
 import { StatusBadge } from '../components/StatusBadge'
 import { formatBytes, timeAgo, basename } from '../lib/utils'
-import { ChevronDown, ChevronUp, RotateCcw } from 'lucide-react'
+import { ChevronDown, ChevronUp, RotateCcw, Trash2 } from 'lucide-react'
 
 const PAGE_SIZE = 50
 
@@ -11,6 +11,7 @@ export function History() {
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(true)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const [clearing, setClearing] = useState(false)
 
   const load = useCallback(async (reset = false) => {
     const off = reset ? 0 : offset
@@ -37,6 +38,17 @@ export function History() {
     } catch {}
   }
 
+  const clearHistory = async () => {
+    if (!confirm('Clear all failed, cancelled, and skipped jobs from history?')) return
+    setClearing(true)
+    try {
+      await api.clearHistory()
+      load(true)
+    } catch {} finally {
+      setClearing(false)
+    }
+  }
+
   const toggle = (id: number) =>
     setExpanded(s => {
       const next = new Set(s)
@@ -46,7 +58,19 @@ export function History() {
 
   return (
     <div className="p-6">
-      <h1 className="text-xl font-semibold text-stone-900 mb-6">History</h1>
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-xl font-semibold text-stone-900">History</h1>
+        {jobs.length > 0 && (
+          <button
+            onClick={clearHistory}
+            disabled={clearing}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-stone-300 text-stone-600 hover:bg-stone-50 rounded-md transition-colors disabled:opacity-50"
+          >
+            <Trash2 size={14} />
+            {clearing ? 'Clearing…' : 'Clear History'}
+          </button>
+        )}
+      </div>
 
       {jobs.length === 0 ? (
         <p className="text-sm text-stone-400 py-8 text-center">No jobs yet</p>
@@ -76,6 +100,11 @@ export function History() {
                     </p>
                   </div>
                   <StatusBadge status={job.Status} />
+                  {job.EncoderUsed?.Valid && /software|libx265/i.test(job.EncoderUsed.String) && (
+                    <span className="text-xs bg-amber-100 text-amber-700 font-medium px-1.5 py-0.5 rounded shrink-0" title="Fell back to software encode — GPU was not used">
+                      SW
+                    </span>
+                  )}
                   {(job.Status === 'failed' || job.Status === 'cancelled') && (
                     <button
                       onClick={e => { e.stopPropagation(); retry(job.ID) }}
@@ -90,14 +119,54 @@ export function History() {
 
                 {isExpanded && (
                   <div className="border-t border-stone-100 px-4 py-3 bg-stone-50 text-xs text-stone-600 space-y-1">
-                    <p><span className="text-stone-400">Path:</span> {job.SourcePath}</p>
-                    <p><span className="text-stone-400">Codec:</span> {job.SourceCodec}</p>
-                    <p><span className="text-stone-400">Size:</span> {formatBytes(job.SourceSize)}</p>
-                    {job.EncoderUsed?.Valid && (
-                      <p><span className="text-stone-400">Encoder:</span> {job.EncoderUsed.String}</p>
-                    )}
+                    <p className="text-stone-400 break-all">{job.SourcePath}</p>
+                    {(() => {
+                      const outputBytes = job.OutputSize?.Valid ? job.OutputSize.Int64 : null
+                      const savedBytes  = job.BytesSaved?.Valid ? job.BytesSaved.Int64 : null
+                      // Derive source size: stored directly, or reconstruct from output + saved.
+                      const sourceBytes = job.SourceSize > 0
+                        ? job.SourceSize
+                        : (outputBytes !== null && savedBytes !== null ? outputBytes + savedBytes : null)
+                      const pct = sourceBytes && savedBytes && sourceBytes > 0
+                        ? Math.round((savedBytes / sourceBytes) * 100)
+                        : null
+
+                      return job.Status === 'done' ? (
+                        <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1">
+                          {sourceBytes !== null && (
+                            <span>
+                              <span className="text-stone-400">Before: </span>
+                              {formatBytes(sourceBytes)}
+                              {job.SourceCodec && <span className="text-stone-400"> · {job.SourceCodec}</span>}
+                            </span>
+                          )}
+                          {outputBytes !== null && (
+                            <span>
+                              <span className="text-stone-400">After: </span>
+                              {formatBytes(outputBytes)}
+                              {job.EncoderUsed?.Valid && <span className="text-stone-400"> · {job.EncoderUsed.String}</span>}
+                            </span>
+                          )}
+                          {savedBytes !== null && savedBytes > 0 && (
+                            <span className="text-green-700 font-medium">
+                              Saved {formatBytes(savedBytes)}{pct !== null ? ` (${pct}%)` : ''}
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <>
+                          {job.SourceCodec && <p><span className="text-stone-400">Codec: </span>{job.SourceCodec}</p>}
+                          {sourceBytes !== null && <p><span className="text-stone-400">Size: </span>{formatBytes(sourceBytes)}</p>}
+                          {job.EncoderUsed?.Valid && <p><span className="text-stone-400">Encoder: </span>{job.EncoderUsed.String}</p>}
+                        </>
+                      )
+                    })()}
                     {errMsg && (
-                      <p className="text-red-600"><span className="text-stone-400">Error:</span> {errMsg}</p>
+                      <div className="mt-1">
+                        <pre className="whitespace-pre-wrap break-all text-red-600 bg-red-50 border border-red-100 rounded p-2 font-mono text-xs max-h-48 overflow-y-auto">
+                          {errMsg}
+                        </pre>
+                      </div>
                     )}
                   </div>
                 )}
