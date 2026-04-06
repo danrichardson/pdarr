@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { api, type Job } from '../lib/api'
 import { StatusBadge } from '../components/StatusBadge'
 import { formatBytes, timeAgo, basename } from '../lib/utils'
-import { ChevronDown, ChevronUp, RotateCcw, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, RotateCcw, Trash2, ArrowRight } from 'lucide-react'
 
 const PAGE_SIZE = 50
 
@@ -131,28 +131,38 @@ export function History() {
                         ? Math.round((savedBytes / sourceBytes) * 100)
                         : null
 
-                      return job.Status === 'done' ? (
-                        <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1">
-                          {sourceBytes !== null && (
-                            <span>
-                              <span className="text-stone-400">Before: </span>
-                              {formatBytes(sourceBytes)}
-                              {job.SourceCodec && <span className="text-stone-400"> · {job.SourceCodec}</span>}
-                            </span>
+                      return (job.Status === 'done' || job.Status === 'staged') ? (
+                        <>
+                          <div className="flex flex-wrap gap-x-4 gap-y-0.5 mt-1">
+                            {sourceBytes !== null && (
+                              <span>
+                                <span className="text-stone-400">Before: </span>
+                                {formatBytes(sourceBytes)}
+                                {job.SourceCodec && <span className="text-stone-400"> · {job.SourceCodec}</span>}
+                              </span>
+                            )}
+                            {outputBytes !== null && (
+                              <span>
+                                <span className="text-stone-400">After: </span>
+                                {formatBytes(outputBytes)}
+                                {job.EncoderUsed?.Valid && <span className="text-stone-400"> · {job.EncoderUsed.String}</span>}
+                              </span>
+                            )}
+                            {savedBytes !== null && savedBytes > 0 && (
+                              <span className="text-green-700 font-medium">
+                                Saved {formatBytes(savedBytes)}{pct !== null ? ` (${pct}%)` : ''}
+                              </span>
+                            )}
+                          </div>
+                          {job.Status === 'staged' && (
+                            <p className="mt-2 text-stone-400">
+                              Original held for review.{' '}
+                              <a href="/review" className="text-amber-600 hover:text-amber-700 inline-flex items-center gap-0.5">
+                                Go to Review <ArrowRight size={11} />
+                              </a>
+                            </p>
                           )}
-                          {outputBytes !== null && (
-                            <span>
-                              <span className="text-stone-400">After: </span>
-                              {formatBytes(outputBytes)}
-                              {job.EncoderUsed?.Valid && <span className="text-stone-400"> · {job.EncoderUsed.String}</span>}
-                            </span>
-                          )}
-                          {savedBytes !== null && savedBytes > 0 && (
-                            <span className="text-green-700 font-medium">
-                              Saved {formatBytes(savedBytes)}{pct !== null ? ` (${pct}%)` : ''}
-                            </span>
-                          )}
-                        </div>
+                        </>
                       ) : (
                         <>
                           {job.SourceCodec && <p><span className="text-stone-400">Codec: </span>{job.SourceCodec}</p>}

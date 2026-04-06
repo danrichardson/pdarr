@@ -17,8 +17,8 @@ func (db *DB) GetStats() (*Stats, error) {
 	s := &Stats{UpdatedAt: time.Now()}
 	err := db.conn.QueryRow(`
 		SELECT
-			COALESCE(SUM(CASE WHEN status='done' THEN COALESCE(bytes_saved,0) ELSE 0 END), 0),
-			COUNT(CASE WHEN status='done' THEN 1 END),
+			COALESCE(SUM(CASE WHEN status IN ('done','staged') THEN COALESCE(bytes_saved,0) ELSE 0 END), 0),
+			COUNT(CASE WHEN status IN ('done','staged') THEN 1 END),
 			COUNT(CASE WHEN status='failed' THEN 1 END)
 		FROM jobs`).Scan(&s.TotalBytesSaved, &s.TotalJobsDone, &s.TotalJobsFailed)
 	if err != nil {

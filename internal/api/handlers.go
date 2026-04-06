@@ -172,6 +172,66 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// POST /jobs/enqueue-dir — recursively enqueue all video files under a directory
+func (s *Server) handleEnqueueDir(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" {
+		jsonError(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	abs, err := filepath.Abs(req.Path)
+	if err != nil {
+		jsonError(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	if !s.safePathIn(abs) {
+		jsonError(w, "path is not within a configured directory", http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		jsonError(w, "path is not a directory", http.StatusBadRequest)
+		return
+	}
+
+	var queued, skipped int
+	err = filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
+			return nil
+		}
+		if !videoExtensions[strings.ToLower(filepath.Ext(d.Name()))] {
+			return nil
+		}
+		exists, _ := s.db.SourcePathExists(path)
+		if exists {
+			skipped++
+			return nil
+		}
+		if _, err := s.db.InsertJob(&db.Job{
+			SourcePath: path,
+			Status:     db.JobPending,
+			Priority:   1,
+		}); err == nil {
+			queued++
+		}
+		return nil
+	})
+	if err != nil {
+		jsonError(w, "error walking directory", http.StatusInternalServerError)
+		return
+	}
+	jsonOK(w, map[string]int{"queued": queued, "skipped": skipped})
+}
+
 // POST /jobs/clear — delete failed/cancelled/skipped/released jobs from history
 func (s *Server) handleClearHistory(w http.ResponseWriter, r *http.Request) {
 	n, err := s.db.ClearHistory()
@@ -437,15 +497,29 @@ func (s *Server) handleLastScan(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, run)
 }
 
+// persistPaused writes the pause state to the config file so it survives restarts.
+func (s *Server) persistPaused(paused bool) {
+	s.cfg.Scanner.Paused = paused
+	if s.cfgPath != "" {
+		if err := config.UpdateFile(s.cfgPath, map[string]string{
+			"paused": strconv.FormatBool(paused),
+		}); err != nil {
+			s.log.Warn("could not persist pause state", "error", err)
+		}
+	}
+}
+
 // POST /queue/pause
 func (s *Server) handlePauseQueue(w http.ResponseWriter, r *http.Request) {
 	s.worker.SetPaused(true)
+	s.persistPaused(true)
 	jsonOK(w, map[string]bool{"paused": true})
 }
 
 // POST /queue/resume
 func (s *Server) handleResumeQueue(w http.ResponseWriter, r *http.Request) {
 	s.worker.SetPaused(false)
+	s.persistPaused(false)
 	jsonOK(w, map[string]bool{"paused": false})
 }
 
@@ -695,6 +769,7 @@ func (s *Server) handleDeleteOriginal(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "database error", http.StatusInternalServerError)
 		return
 	}
+	s.db.UpdateJobStatus(rec.JobID, db.JobDone, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -78,9 +78,12 @@ func New(
 		log:     log,
 	}
 
-	// Subscribe worker events to WebSocket hub.
+	// Subscribe worker events to WebSocket hub; also persist auto-pause to config.
 	w.Subscribe(func(e queue.Event) {
 		srv.hub.broadcast(e)
+		if e.Type == queue.EventPaused {
+			srv.persistPaused(true)
+		}
 	})
 
 	mux := http.NewServeMux()
@@ -106,6 +109,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	api.HandleFunc("GET /jobs", s.handleListJobs)
 	api.HandleFunc("POST /jobs", s.handleCreateJob)
 	api.HandleFunc("POST /jobs/clear", s.handleClearHistory)
+	api.HandleFunc("POST /jobs/enqueue-dir", s.handleEnqueueDir)
 	api.HandleFunc("GET /jobs/{id}", s.handleGetJob)
 	api.HandleFunc("DELETE /jobs/{id}", s.handleCancelJob)
 	api.HandleFunc("POST /jobs/{id}/retry", s.handleRetryJob)

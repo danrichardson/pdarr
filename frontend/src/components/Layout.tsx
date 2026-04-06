@@ -7,18 +7,35 @@ import {
   FolderOpen,
   Archive,
   Settings,
+  PauseCircle,
+  Play,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { api } from '../lib/api'
 
 export function Layout() {
   const [originalsCount, setOriginalsCount] = useState(0)
+  const [paused, setPaused] = useState(false)
+  const [resuming, setResuming] = useState(false)
 
   useEffect(() => {
     api.listOriginals()
       .then(r => setOriginalsCount(r?.length ?? 0))
       .catch(() => {})
+    api.getStatus()
+      .then(s => setPaused(s.paused))
+      .catch(() => {})
   }, [])
+
+  const handleResume = async () => {
+    setResuming(true)
+    try {
+      await api.resumeQueue()
+      setPaused(false)
+    } catch {} finally {
+      setResuming(false)
+    }
+  }
 
   const nav = [
     { to: '/',            label: 'Dashboard',  icon: LayoutDashboard, badge: 0 },
@@ -66,6 +83,23 @@ export function Layout() {
 
       {/* Main content */}
       <main className="flex-1 flex flex-col min-w-0 pb-16 md:pb-0">
+        {paused && (
+          <div className="flex items-center justify-between gap-3 px-4 py-2.5 bg-amber-50 border-b border-amber-200">
+            <div className="flex items-center gap-2 text-amber-800">
+              <PauseCircle size={15} className="shrink-0" />
+              <span className="text-sm font-medium">Queue is paused</span>
+              <span className="text-xs text-amber-600 hidden sm:inline">— no jobs will be processed until resumed</span>
+            </div>
+            <button
+              onClick={handleResume}
+              disabled={resuming}
+              className="flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white rounded transition-colors shrink-0"
+            >
+              <Play size={11} />
+              {resuming ? 'Resuming…' : 'Resume'}
+            </button>
+          </div>
+        )}
         <Outlet />
       </main>
 

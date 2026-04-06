@@ -191,6 +191,7 @@ If upgrading an existing installation, run any required schema changes before st
 | Version | Change | Command |
 |---------|--------|---------|
 | Post-phase-4 → current | Added `file_size` column to `quarantine` table | `sqlite3 /var/lib/sqzarr/sqzarr.db 'ALTER TABLE quarantine ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0;'` |
+| 2026-04-06 | Fix jobs stuck in `staged` after originals reviewed/expired | `sqlite3 /var/lib/sqzarr/sqzarr.db "UPDATE jobs SET status='done' WHERE status='staged' AND id IN (SELECT job_id FROM originals WHERE deleted_at IS NOT NULL);"` |
 
 ---
 
@@ -237,11 +238,15 @@ go build -trimpath -ldflags='-s -w' -o /usr/local/bin/sqzarr ./cmd/sqzarr/
 Navigate to `http://<host>:8080` after starting the service.
 
 - **Dashboard**: encoder in use, space saved, jobs done/failed, active job progress, disk space (measured at your first configured media directory)
-- **Queue**: manual file enqueue with filesystem browser, running job with live progress, pending list with cancel
-- **History**: paginated job history with expandable error detail (full ffmpeg output on failure), retry button, clear history
-- **Directories**: add/edit/delete watched directories with per-directory rules; filesystem browser for path selection
-- **Processed**: originals held after successful transcode; restore (roll back) or purge (delete early) per file
+- **Queue**: manual file enqueue with filesystem browser; click the folder+ icon next to any directory to recursively enqueue all qualifying files in one shot; running job with live progress; pending list with cancel
+- **History**: paginated job history with expandable before/after size detail; staged jobs show "Go to Review" link; retry failed/cancelled jobs
+- **Directories**: add multiple directories at once with shared settings; inline edit (pencil turns the row into a form in-place); filesystem browser for path selection
+- **Review**: originals held after successful transcode; delete (accept transcode) or restore (roll back) or restore+exclude per file; bulk select and delete
 - **Settings**: encoder info, scan interval, worker concurrency, retention period, Plex config - all editable live
+
+### Paused state
+
+When the queue is paused (manually or auto-paused after consecutive failures), an amber banner appears at the top of every page with a one-click Resume button. Pause state is persisted to `sqzarr.toml` so it survives service restarts.
 
 ---
 
@@ -257,7 +262,7 @@ Navigate to `http://<host>:8080` after starting the service.
 ## FAQ
 
 **Q: Will it delete my files?**  
-When `quarantine_enabled = true` (the default), originals are held for `quarantine_retention_days` (default 10) before deletion. You can restore any file within that window from the Processed page or via `sqzarr restore <job-id>`.
+When originals retention is enabled (the default), originals are held for `originals_retention_days` (default 10) before deletion. You can restore any file within that window from the Review page or via `sqzarr restore <job-id>`.
 
 **Q: What if the output is larger than the input?**  
 The verifier rejects it. The original is restored and the job is marked failed. Nothing is lost.

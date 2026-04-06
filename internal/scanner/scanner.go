@@ -129,7 +129,16 @@ func (s *Scanner) maybeEnqueue(ctx context.Context, path string, dir *db.Directo
 	case db.JobFailed, db.JobRestored:
 		// Failed or restored files can be re-queued on the next scan.
 	default:
-		return false, string("status:" + status), nil
+		return false, "status:" + string(status), nil
+	}
+
+	// Skip if this path is the output of a previous transcode job (renamed file).
+	isOutput, err := s.db.OutputPathExists(path)
+	if err != nil {
+		return false, "", err
+	}
+	if isOutput {
+		return false, "already a transcode output", nil
 	}
 
 	info, err := os.Stat(path)

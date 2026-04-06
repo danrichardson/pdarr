@@ -30,6 +30,8 @@ type ScannerConfig struct {
 	// RootDirs are the filesystem roots the browser and directory picker are
 	// allowed to access. Paths outside these roots are rejected.
 	RootDirs          []string `toml:"root_dirs"`
+	// Paused persists the queue pause state across restarts.
+	Paused            bool     `toml:"paused"`
 }
 
 type TranscoderConfig struct {

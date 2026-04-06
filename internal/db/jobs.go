@@ -307,6 +307,18 @@ func (db *DB) SourcePathStatus(path string) (JobStatus, error) {
 	return status, nil
 }
 
+// OutputPathExists returns true if a job exists with the given output_path.
+// Used by the scanner to skip files that are the product of a previous transcode.
+func (db *DB) OutputPathExists(path string) (bool, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM jobs WHERE output_path=?`, path).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("output path exists: %w", err)
+	}
+	return count > 0, nil
+}
+
 // SourcePathExists returns true if a non-failed, non-excluded job exists for the given path.
 // Deprecated: prefer SourcePathStatus for fine-grained control.
 func (db *DB) SourcePathExists(path string) (bool, error) {

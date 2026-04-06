@@ -109,6 +109,10 @@ func runServe(cfgPath string) {
 	}
 
 	worker := queue.New(database, cfg, t, plexNotifier, log)
+	if cfg.Scanner.Paused {
+		worker.SetPaused(true)
+		log.Info("queue paused (restored from config)")
+	}
 	scan := scanner.New(database, cfg.Safety.ProcessedDirName, log)
 	sched := scanner.NewScheduler(scan, database, cfg.Scanner.IntervalHours, log)
 

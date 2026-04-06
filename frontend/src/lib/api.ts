@@ -164,6 +164,7 @@ export const api = {
     })}`),
   getJob: (id: number) => request<Job>('GET', `/jobs/${id}`),
   createJob: (path: string) => request<Job>('POST', '/jobs', { path }),
+  enqueueDir: (path: string) => request<{ queued: number; skipped: number }>('POST', '/jobs/enqueue-dir', { path }),
   cancelJob: (id: number) => request<void>('DELETE', `/jobs/${id}`),
   retryJob: (id: number) => request<void>('POST', `/jobs/${id}/retry`),
 

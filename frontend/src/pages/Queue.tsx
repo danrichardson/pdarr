@@ -5,7 +5,7 @@ import { Card } from '../components/Card'
 import { StatusBadge } from '../components/StatusBadge'
 import { ProgressBar } from '../components/ProgressBar'
 import { formatBytes, formatDuration, basename } from '../lib/utils'
-import { X, Check, FolderOpen, ChevronLeft, ArrowUpDown } from 'lucide-react'
+import { X, Check, FolderOpen, ChevronLeft, ArrowUpDown, FolderPlus } from 'lucide-react'
 
 type SortKey = 'name' | 'size' | 'date'
 
@@ -60,7 +60,7 @@ function relDate(iso: string): string {
 
 // ---- File picker modal ----
 
-function FilePicker({ onSelect, onClose }: { onSelect: (paths: string[]) => void; onClose: () => void }) {
+function FilePicker({ onSelect, onQueueDir, onClose }: { onSelect: (paths: string[]) => void; onQueueDir: (dir: string) => void; onClose: () => void }) {
   const [browse, setBrowse] = useState<FSBrowseResult | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -147,14 +147,25 @@ function FilePicker({ onSelect, onClose }: { onSelect: (paths: string[]) => void
                 </button>
               )}
               {browse?.dirs.map(dir => (
-                <button
+                <div
                   key={dir}
-                  onClick={() => navigate(dir)}
-                  className="w-full flex items-center gap-2 px-4 py-2.5 text-sm text-stone-700 hover:bg-stone-50 border-b border-stone-100"
+                  className="w-full flex items-center border-b border-stone-100"
                 >
-                  <FolderOpen size={14} className="text-amber-500 shrink-0" />
-                  <span className="truncate">{basename(dir)}</span>
-                </button>
+                  <button
+                    onClick={() => navigate(dir)}
+                    className="flex-1 flex items-center gap-2 px-4 py-2.5 text-sm text-stone-700 hover:bg-stone-50 min-w-0"
+                  >
+                    <FolderOpen size={14} className="text-amber-500 shrink-0" />
+                    <span className="truncate">{basename(dir)}</span>
+                  </button>
+                  <button
+                    onClick={() => onQueueDir(dir)}
+                    title="Queue all files in this folder recursively"
+                    className="shrink-0 px-3 py-2.5 text-stone-400 hover:text-amber-600 hover:bg-amber-50 transition-colors"
+                  >
+                    <FolderPlus size={14} />
+                  </button>
+                </div>
               ))}
               {sortedFiles.map(file => {
                 const isSelected = selected.has(file.path)
@@ -232,7 +243,7 @@ export function Queue() {
   const [manualPath, setManualPath] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState<string | null>(null)
-  const [submitSuccess, setSubmitSuccess] = useState(false)
+  const [submitSuccess, setSubmitSuccess] = useState<string | false>(false)
   const [showPicker, setShowPicker] = useState(false)
 
   const load = useCallback(async () => {
@@ -257,7 +268,7 @@ export function Queue() {
     try {
       await api.createJob(manualPath.trim())
       setManualPath('')
-      setSubmitSuccess(true)
+      setSubmitSuccess('Added to queue')
       setTimeout(() => setSubmitSuccess(false), 3000)
       load()
     } catch (err: any) {
@@ -303,8 +314,28 @@ export function Queue() {
             if (failed > 0) {
               setSubmitError(`${failed} file${failed > 1 ? 's' : ''} failed to queue`)
             } else {
-              setSubmitSuccess(true)
+              setSubmitSuccess('Added to queue')
               setTimeout(() => setSubmitSuccess(false), 3000)
+            }
+            load()
+          }}
+          onQueueDir={async dir => {
+            setShowPicker(false)
+            setSubmitting(true)
+            setSubmitError(null)
+            setSubmitSuccess(false)
+            try {
+              const result = await api.enqueueDir(dir)
+              if (result.queued > 0) {
+                setSubmitSuccess(`Queued ${result.queued} file${result.queued !== 1 ? 's' : ''}${result.skipped > 0 ? ` (${result.skipped} already queued)` : ''}`)
+                setTimeout(() => setSubmitSuccess(false), 4000)
+              } else {
+                setSubmitError('No new files to queue (all already queued or no video files found)')
+              }
+            } catch (err: any) {
+              setSubmitError(err.message || 'Failed to queue directory')
+            } finally {
+              setSubmitting(false)
             }
             load()
           }}
@@ -343,7 +374,7 @@ export function Queue() {
         </form>
         {submitSuccess && (
           <p className="mt-2 text-xs text-green-700 flex items-center gap-1">
-            <Check size={12} /> Added to queue
+            <Check size={12} /> {submitSuccess}
           </p>
         )}
         {submitError && (
