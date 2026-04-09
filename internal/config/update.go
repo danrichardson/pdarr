@@ -39,7 +39,9 @@ func UpdateFile(path string, updates map[string]string) error {
 	for key, rawValue := range updates {
 		re := regexp.MustCompile(`(?m)^(\s*` + regexp.QuoteMeta(key) + `\s*=\s*).*$`)
 		if re.MatchString(content) {
-			content = re.ReplaceAllString(content, "${1}"+rawValue)
+			content = re.ReplaceAllStringFunc(content, func(match string) string {
+				return re.FindStringSubmatch(match)[1] + rawValue
+			})
 		} else {
 			// Key not present — insert it into the correct section.
 			section := keySection[key]
