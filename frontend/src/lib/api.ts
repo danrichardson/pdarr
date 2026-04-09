@@ -122,6 +122,7 @@ export interface RuntimeConfig {
   plex_base_url: string
   plex_token: string  // empty string = not set; "SET" = already configured
   encoder: string     // active encoder type: "vaapi", "nvenc", "videotoolbox", "software"
+  has_password: boolean
 }
 
 export interface EncoderOption {

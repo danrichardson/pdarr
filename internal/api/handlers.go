@@ -686,13 +686,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"token": token})
 }
 
-// POST /auth/change-password — change the user's password
+// POST /auth/change-password — change or set the user's password
 func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Auth.PasswordHash == "" {
-		jsonError(w, "authentication not configured", http.StatusNotFound)
-		return
-	}
-
 	var req struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
@@ -701,8 +696,8 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if req.CurrentPassword == "" || req.NewPassword == "" {
-		jsonError(w, "current_password and new_password are required", http.StatusBadRequest)
+	if req.NewPassword == "" {
+		jsonError(w, "new_password is required", http.StatusBadRequest)
 		return
 	}
 	if len(req.NewPassword) < 8 {
@@ -710,13 +705,19 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify current password.
-	if err := bcrypt.CompareHashAndPassword(
-		[]byte(s.cfg.Auth.PasswordHash),
-		[]byte(req.CurrentPassword),
-	); err != nil {
-		jsonError(w, "current password is incorrect", http.StatusUnauthorized)
-		return
+	// If a password is already set, verify the current one.
+	if s.cfg.Auth.PasswordHash != "" {
+		if req.CurrentPassword == "" {
+			jsonError(w, "current_password is required", http.StatusBadRequest)
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword(
+			[]byte(s.cfg.Auth.PasswordHash),
+			[]byte(req.CurrentPassword),
+		); err != nil {
+			jsonError(w, "current password is incorrect", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// Hash the new password.
@@ -789,6 +790,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"plex_base_url":              s.cfg.Plex.BaseURL,
 		"plex_token":                 plexToken,
 		"encoder":                    activeEncoder,
+		"has_password":               s.cfg.Auth.PasswordHash != "",
 	})
 }
 

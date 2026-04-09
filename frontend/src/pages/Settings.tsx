@@ -537,10 +537,11 @@ export function Settings() {
       {/* Password Change */}
       <section>
         <h2 className="text-sm font-medium text-stone-500 mb-3 flex items-center gap-1.5">
-          <Lock size={14} /> Change Password
+          <Lock size={14} /> {cfg?.has_password ? 'Change Password' : 'Set Password'}
         </h2>
         <Card className="space-y-4">
           <div className="space-y-3">
+            {cfg?.has_password && (
             <div className="flex items-center justify-between gap-4">
               <label className="text-sm text-stone-700 shrink-0">Current password</label>
               <input
@@ -550,6 +551,7 @@ export function Settings() {
                 className="flex-1 min-w-0 max-w-xs text-sm border border-stone-300 rounded-md px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-amber-400"
               />
             </div>
+            )}
             <div className="flex items-center justify-between gap-4">
               <label className="text-sm text-stone-700 shrink-0">New password</label>
               <input
@@ -586,7 +588,7 @@ export function Settings() {
               type="button"
               disabled={
                 pwSaving ||
-                !currentPassword ||
+                (cfg?.has_password && !currentPassword) ||
                 !newPassword ||
                 newPassword.length < 8 ||
                 newPassword !== confirmPassword
@@ -609,7 +611,7 @@ export function Settings() {
               }}
               className="px-4 py-2 text-sm bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white rounded-md transition-colors"
             >
-              {pwSaving ? 'Changing...' : 'Change Password'}
+              {pwSaving ? 'Saving...' : cfg?.has_password ? 'Change Password' : 'Set Password'}
             </button>
           </div>
         </Card>
