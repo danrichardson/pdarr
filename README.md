@@ -237,12 +237,12 @@ go build -trimpath -ldflags='-s -w' -o /usr/local/bin/sqzarr ./cmd/sqzarr/
 
 Navigate to `http://<host>:8080` after starting the service.
 
-- **Dashboard**: encoder in use, space saved, jobs done/failed, active job progress, disk space (measured at your first configured media directory)
+- **Dashboard**: clickable stat cards — space saved links to per-file savings breakdown, jobs done/failed link to filtered history; active job progress, disk space
 - **Queue**: manual file enqueue with filesystem browser; click the folder+ icon next to any directory to recursively enqueue all qualifying files in one shot; running job with live progress; pending list with cancel
-- **History**: paginated job history with expandable before/after size detail; staged jobs show "Go to Review" link; retry failed/cancelled jobs
-- **Directories**: add multiple directories at once with shared settings; inline edit (pencil turns the row into a form in-place); filesystem browser for path selection
+- **History**: paginated job history with status filter pills; expandable before/after size detail; staged jobs show "Go to Review" link; retry failed/cancelled jobs; I/O errors distinguished from exclusions
+- **Directories**: add multiple directories at once with shared settings; copy settings from existing directory; configurable bitrate skip margin; inline edit; filesystem browser for path selection
 - **Review**: originals held after successful transcode; delete (accept transcode) or restore (roll back) or restore+exclude per file; bulk select and delete
-- **Settings**: encoder info, scan interval, worker concurrency, retention period, Plex config - all editable live
+- **Settings**: encoder selection (switch between detected HW encoders + software fallback at runtime), scan interval, worker concurrency, retention period, Plex config, password management (set/change/remove) — all editable live
 
 ### Paused state
 
@@ -253,7 +253,7 @@ When the queue is paused (manually or auto-paused after consecutive failures), a
 ## Security notes
 
 - The admin panel is bound to `127.0.0.1` by default. Not exposed to LAN without changing `host`
-- Authentication is optional; set `password_hash` to enable it
+- Authentication is optional — set a password from the Settings page or via `sqzarr hash-password`. Can be removed from Settings at any time
 - All file paths in API requests are validated against configured directory roots (path traversal prevention)
 - Config file should not be world-readable: `chmod 600 /etc/sqzarr/sqzarr.toml`
 

@@ -7,3 +7,12 @@ dist/
 *.db-wal
 /etc/
 .worktrees/
+
+# Local deploy script (use deploy.bat.example as template)
+deploy.bat
+
+# Internal handoff/ops docs with infrastructure details
+docs/handoff-*.md
+docs/deficiency-report.md
+docs/sqzarr-fix-brief.md
+docs/verification-*.md
