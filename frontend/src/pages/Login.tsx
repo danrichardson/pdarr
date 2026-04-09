@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useState, useEffect, type FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
 
@@ -6,7 +6,25 @@ export function Login() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [checking, setChecking] = useState(true)
   const navigate = useNavigate()
+
+  // If no password is configured, skip login entirely.
+  useEffect(() => {
+    api.getConfig()
+      .then(cfg => {
+        if (!cfg.has_password) {
+          localStorage.removeItem('sqzarr_token')
+          navigate('/', { replace: true })
+        } else {
+          setChecking(false)
+        }
+      })
+      .catch(() => {
+        // Config returned 401 → auth is required, show the form.
+        setChecking(false)
+      })
+  }, [navigate])
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
@@ -22,6 +40,8 @@ export function Login() {
       setLoading(false)
     }
   }
+
+  if (checking) return null
 
   return (
     <div className="min-h-screen bg-stone-50 flex items-center justify-center">
