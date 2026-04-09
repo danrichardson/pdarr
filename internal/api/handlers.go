@@ -715,7 +715,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 			[]byte(s.cfg.Auth.PasswordHash),
 			[]byte(req.CurrentPassword),
 		); err != nil {
-			jsonError(w, "current password is incorrect", http.StatusUnauthorized)
+			jsonError(w, "current password is incorrect", http.StatusForbidden)
 			return
 		}
 	}
@@ -764,7 +764,7 @@ func (s *Server) handleRemovePassword(w http.ResponseWriter, r *http.Request) {
 		[]byte(s.cfg.Auth.PasswordHash),
 		[]byte(req.CurrentPassword),
 	); err != nil {
-		jsonError(w, "current password is incorrect", http.StatusUnauthorized)
+		jsonError(w, "current password is incorrect", http.StatusForbidden)
 		return
 	}
 
